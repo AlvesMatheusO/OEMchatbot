@@ -23,11 +23,10 @@
     --text-lo:     #4a5168;
     --green:       #22c55e;
     --red:         #ef4444;
-    --blue:        #60a5fa;
     --bubble-bot:  #1a1e26;
     --bubble-user: #1e2a1a;
     --bubble-user-border: #2d4a22;
-    --radius:      6px;
+    --radius: 6px;
     --font-display: 'Barlow Condensed', sans-serif;
     --font-body:    'Barlow', sans-serif;
     --font-mono:    'JetBrains Mono', monospace;
@@ -45,7 +44,6 @@
     overscroll-behavior: none;
   }
 
-  /* ── LAYOUT ── */
   #app {
     display: flex;
     flex-direction: column;
@@ -55,7 +53,6 @@
     background: var(--bg-shell);
     border-left: 1px solid var(--border);
     border-right: 1px solid var(--border);
-    position: relative;
   }
 
   /* ── HEADER ── */
@@ -68,419 +65,227 @@
     background: var(--bg-card);
     border-bottom: 2px solid var(--amber);
     flex-shrink: 0;
-    position: relative;
-    z-index: 10;
   }
-
   .logo-mark {
-    width: 36px;
-    height: 36px;
+    width: 36px; height: 36px;
     background: var(--amber);
     border-radius: 4px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    display: flex; align-items: center; justify-content: center;
     flex-shrink: 0;
   }
   .logo-mark svg { width: 22px; height: 22px; fill: #000; }
-
   .header-info { flex: 1; }
   .header-title {
     font-family: var(--font-display);
-    font-size: 20px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-hi);
-    line-height: 1;
+    font-size: 20px; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-hi); line-height: 1;
   }
   .header-sub {
-    font-size: 11px;
-    color: var(--text-mid);
-    font-family: var(--font-mono);
-    letter-spacing: 0.04em;
-    margin-top: 2px;
+    font-size: 11px; color: var(--text-mid);
+    font-family: var(--font-mono); letter-spacing: 0.04em; margin-top: 2px;
   }
-
   .status-dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: var(--green);
-    box-shadow: 0 0 8px var(--green);
-    animation: pulse 2s ease-in-out infinite;
-    flex-shrink: 0;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s ease-in-out infinite; flex-shrink: 0;
   }
-  @keyframes pulse {
-    0%,100% { opacity: 1; } 50% { opacity: 0.4; }
+  #status-label {
+    font-size: 10px; font-family: var(--font-mono);
+    color: var(--text-mid); flex-shrink: 0;
   }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-  /* ── QUICK COMMANDS BAR ── */
+  /* ── QUICK BAR ── */
   #quickbar {
-    display: flex;
-    gap: 6px;
-    padding: 8px 18px;
-    overflow-x: auto;
-    background: var(--bg-void);
-    border-bottom: 1px solid var(--border);
-    flex-shrink: 0;
+    display: flex; gap: 6px; padding: 8px 18px;
+    overflow-x: auto; background: var(--bg-void);
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
     scrollbar-width: none;
   }
   #quickbar::-webkit-scrollbar { display: none; }
-
   .qchip {
-    flex-shrink: 0;
-    padding: 4px 10px;
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-mid);
-    background: var(--bg-card);
-    cursor: pointer;
-    transition: border-color 0.15s, color 0.15s, background 0.15s;
-    white-space: nowrap;
-    user-select: none;
+    flex-shrink: 0; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: 20px;
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--text-mid); background: var(--bg-card);
+    cursor: pointer; transition: .15s; white-space: nowrap; user-select: none;
   }
-  .qchip:hover, .qchip:active {
-    border-color: var(--amber);
-    color: var(--amber);
-    background: var(--amber-glow);
-  }
+  .qchip:hover { border-color: var(--amber); color: var(--amber); background: var(--amber-glow); }
 
-  /* ── CHAT AREA ── */
+  /* ── CHAT ── */
   #chat {
-    flex: 1;
-    overflow-y: auto;
-    padding: 18px 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
+    flex: 1; overflow-y: auto; padding: 18px 16px;
+    display: flex; flex-direction: column; gap: 14px;
     scroll-behavior: smooth;
-    scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
   }
   #chat::-webkit-scrollbar { width: 4px; }
-  #chat::-webkit-scrollbar-track { background: transparent; }
   #chat::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
   /* ── MESSAGES ── */
   .msg {
-    display: flex;
-    flex-direction: column;
-    max-width: 88%;
-    animation: msgIn 0.2s ease-out;
+    display: flex; flex-direction: column; max-width: 88%;
+    animation: msgIn .2s ease-out;
   }
-  @keyframes msgIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
-
-  .msg.bot { align-self: flex-start; }
+  @keyframes msgIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  .msg.bot  { align-self: flex-start; }
   .msg.user { align-self: flex-end; }
-
   .msg-label {
-    font-size: 10px;
-    font-family: var(--font-mono);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    margin-bottom: 4px;
+    font-size: 10px; font-family: var(--font-mono);
+    letter-spacing: .06em; text-transform: uppercase; margin-bottom: 4px;
   }
-  .msg.bot .msg-label { color: var(--amber-dim); padding-left: 2px; }
+  .msg.bot  .msg-label { color: var(--amber-dim); padding-left: 2px; }
   .msg.user .msg-label { color: var(--text-lo); text-align: right; padding-right: 2px; }
 
   .bubble {
-    padding: 12px 14px;
-    border-radius: var(--radius);
-    line-height: 1.55;
-    word-break: break-word;
-    white-space: pre-wrap;
+    padding: 12px 14px; border-radius: var(--radius);
+    line-height: 1.55; word-break: break-word; white-space: pre-wrap;
   }
-
   .msg.bot .bubble {
-    background: var(--bubble-bot);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--amber);
-    color: var(--text-hi);
-    font-size: 14px;
+    background: var(--bubble-bot); border: 1px solid var(--border);
+    border-left: 3px solid var(--amber); color: var(--text-hi); font-size: 14px;
   }
-
   .msg.user .bubble {
-    background: var(--bubble-user);
-    border: 1px solid var(--bubble-user-border);
-    color: var(--text-hi);
-    font-size: 14px;
+    background: var(--bubble-user); border: 1px solid var(--bubble-user-border);
+    color: var(--text-hi); font-size: 14px;
   }
+  .bubble img { max-width: 200px; border-radius: 4px; display: block; margin-bottom: 6px; }
 
-  /* Image preview bubble */
-  .bubble img {
-    max-width: 200px;
-    border-radius: 4px;
-    display: block;
-    margin-bottom: 6px;
-  }
-
-  /* Peça card inside bubble */
-  .peca-card {
-    background: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 10px 12px;
-    margin-top: 8px;
-  }
-  .peca-card-title {
-    font-family: var(--font-display);
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--amber);
-    letter-spacing: 0.04em;
-    margin-bottom: 6px;
-  }
-  .peca-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 3px;
-    font-size: 12px;
-  }
-  .peca-key { color: var(--text-mid); min-width: 80px; font-family: var(--font-mono); }
-  .peca-val { color: var(--text-hi); font-family: var(--font-mono); font-weight: 500; }
-
-  /* Typing indicator */
+  /* Typing */
   .typing-indicator {
-    display: flex;
-    gap: 4px;
-    padding: 10px 14px;
-    background: var(--bubble-bot);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--amber);
-    border-radius: var(--radius);
-    width: fit-content;
+    display: flex; gap: 4px; padding: 10px 14px;
+    background: var(--bubble-bot); border: 1px solid var(--border);
+    border-left: 3px solid var(--amber); border-radius: var(--radius); width: fit-content;
   }
   .typing-indicator span {
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    background: var(--amber);
+    width: 6px; height: 6px; border-radius: 50%; background: var(--amber);
     animation: typing 1.2s ease-in-out infinite;
   }
-  .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
-  .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes typing {
-    0%,80%,100% { opacity: 0.2; transform: scale(0.8); }
-    40%         { opacity: 1;   transform: scale(1); }
-  }
+  .typing-indicator span:nth-child(2) { animation-delay: .2s; }
+  .typing-indicator span:nth-child(3) { animation-delay: .4s; }
+  @keyframes typing { 0%,80%,100%{opacity:.2;transform:scale(.8)} 40%{opacity:1;transform:scale(1)} }
 
-  /* ── QUICK OPTION BUTTONS ── */
-  .option-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 10px;
-  }
+  /* Quick option buttons */
+  .option-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
   .opt-btn {
-    padding: 5px 12px;
-    border: 1px solid var(--amber-dim);
-    border-radius: 4px;
-    background: transparent;
-    color: var(--amber);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    padding: 5px 12px; border: 1px solid var(--amber-dim); border-radius: 4px;
+    background: transparent; color: var(--amber);
+    font-family: var(--font-mono); font-size: 12px; cursor: pointer; transition: .15s;
   }
   .opt-btn:hover { background: var(--amber-glow); }
 
   /* ── INPUT AREA ── */
   #input-area {
-    background: var(--bg-card);
-    border-top: 1px solid var(--border);
-    padding: 10px 14px;
-    flex-shrink: 0;
+    background: var(--bg-card); border-top: 1px solid var(--border);
+    padding: 10px 14px; flex-shrink: 0;
     padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
-
-  /* Image preview strip */
   #img-preview-wrap {
-    display: none;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 8px;
-    padding: 6px 10px;
-    background: var(--bg-input);
-    border: 1px solid var(--border-hot);
-    border-radius: 4px;
+    display: none; align-items: center; gap: 8px; margin-bottom: 8px;
+    padding: 6px 10px; background: var(--bg-input);
+    border: 1px solid var(--border-hot); border-radius: 4px;
   }
   #img-preview-wrap.visible { display: flex; }
   #img-preview-thumb {
-    width: 40px; height: 40px;
-    object-fit: cover;
-    border-radius: 3px;
-    border: 1px solid var(--border);
+    width: 40px; height: 40px; object-fit: cover;
+    border-radius: 3px; border: 1px solid var(--border);
   }
   #img-preview-name {
-    flex: 1;
-    font-size: 12px;
-    font-family: var(--font-mono);
-    color: var(--text-mid);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    flex: 1; font-size: 12px; font-family: var(--font-mono);
+    color: var(--text-mid); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
   }
   #img-preview-remove {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: var(--text-mid);
-    font-size: 16px;
-    line-height: 1;
-    padding: 2px;
-    transition: color 0.15s;
+    background: none; border: none; cursor: pointer;
+    color: var(--text-mid); font-size: 16px; line-height: 1; padding: 2px;
+    transition: color .15s;
   }
   #img-preview-remove:hover { color: var(--red); }
 
-  /* Row of input + send */
-  .input-row {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
-  }
+  .input-row { display: flex; align-items: flex-end; gap: 8px; }
 
-  /* Attach / camera buttons */
   .icon-btn {
-    width: 42px; height: 42px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-input);
-    color: var(--text-mid);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: border-color 0.15s, color 0.15s, background 0.15s;
+    width: 42px; height: 42px; border: 1px solid var(--border);
+    border-radius: var(--radius); background: var(--bg-input);
+    color: var(--text-mid); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: .15s;
   }
   .icon-btn:hover { border-color: var(--amber); color: var(--amber); background: var(--amber-glow); }
   .icon-btn svg { width: 18px; height: 18px; }
 
   #user-input {
-    flex: 1;
-    background: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text-hi);
-    font-family: var(--font-body);
-    font-size: 15px;
-    padding: 10px 14px;
-    resize: none;
-    line-height: 1.4;
-    min-height: 42px;
-    max-height: 120px;
-    outline: none;
-    transition: border-color 0.15s;
-    scrollbar-width: none;
+    flex: 1; background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: var(--radius); color: var(--text-hi);
+    font-family: var(--font-body); font-size: 15px; padding: 10px 14px;
+    resize: none; line-height: 1.4; min-height: 42px; max-height: 120px;
+    outline: none; transition: border-color .15s; scrollbar-width: none;
   }
   #user-input::-webkit-scrollbar { display: none; }
   #user-input:focus { border-color: var(--amber); }
   #user-input::placeholder { color: var(--text-lo); }
 
   #send-btn {
-    width: 42px; height: 42px;
-    border-radius: var(--radius);
-    background: var(--amber);
-    border: none;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: background 0.15s, transform 0.1s;
+    width: 42px; height: 42px; border-radius: var(--radius);
+    background: var(--amber); border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: background .15s, transform .1s;
   }
   #send-btn:hover { background: #fbbf24; }
-  #send-btn:active { transform: scale(0.94); }
+  #send-btn:active { transform: scale(.94); }
   #send-btn svg { width: 18px; height: 18px; fill: #000; }
   #send-btn:disabled { background: var(--bg-hover); cursor: not-allowed; }
   #send-btn:disabled svg { fill: var(--text-lo); }
 
   /* ── CAMERA MODAL ── */
   #camera-modal {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.85);
-    z-index: 100;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 16px;
-    padding: 20px;
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.85); z-index: 100;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; padding: 20px;
   }
   #camera-modal.open { display: flex; }
-
   #camera-video {
-    width: 100%;
-    max-width: 480px;
-    aspect-ratio: 4/3;
-    background: #000;
-    border-radius: var(--radius);
-    object-fit: cover;
-    border: 2px solid var(--amber);
+    width: 100%; max-width: 480px; aspect-ratio: 4/3;
+    background: #000; border-radius: var(--radius);
+    object-fit: cover; border: 2px solid var(--amber);
   }
-
-  .camera-controls {
-    display: flex;
-    gap: 14px;
-    align-items: center;
-  }
-
+  .camera-controls { display: flex; gap: 14px; align-items: center; }
   #snap-btn {
-    width: 64px; height: 64px;
-    border-radius: 50%;
-    background: var(--amber);
-    border: 4px solid #fff;
-    cursor: pointer;
-    transition: transform 0.1s;
+    width: 64px; height: 64px; border-radius: 50%;
+    background: var(--amber); border: 4px solid #fff; cursor: pointer; transition: transform .1s;
   }
-  #snap-btn:active { transform: scale(0.9); }
-
+  #snap-btn:active { transform: scale(.9); }
   .cam-cancel {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    color: var(--text-mid);
-    padding: 10px 20px;
-    border-radius: var(--radius);
-    cursor: pointer;
-    font-family: var(--font-body);
-    font-size: 14px;
-    transition: color 0.15s, border-color 0.15s;
+    background: var(--bg-card); border: 1px solid var(--border);
+    color: var(--text-mid); padding: 10px 20px; border-radius: var(--radius);
+    cursor: pointer; font-family: var(--font-body); font-size: 14px; transition: .15s;
   }
   .cam-cancel:hover { color: var(--red); border-color: var(--red); }
 
-  /* Hidden file inputs */
   #file-input, #camera-file-input { display: none; }
 
   /* ── TOAST ── */
   #toast {
-    position: fixed;
-    bottom: 90px;
-    left: 50%;
+    position: fixed; bottom: 90px; left: 50%;
     transform: translateX(-50%) translateY(20px);
-    background: var(--bg-card);
-    border: 1px solid var(--amber);
-    color: var(--amber);
-    font-size: 13px;
-    font-family: var(--font-mono);
-    padding: 8px 16px;
-    border-radius: 20px;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s, transform 0.2s;
-    z-index: 50;
-    white-space: nowrap;
+    background: var(--bg-card); border: 1px solid var(--amber);
+    color: var(--amber); font-size: 13px; font-family: var(--font-mono);
+    padding: 8px 16px; border-radius: 20px; opacity: 0;
+    pointer-events: none; transition: opacity .2s, transform .2s;
+    z-index: 50; white-space: nowrap;
   }
-  #toast.show {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
-  }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-  /* ── RESPONSIVE ── */
+  /* ── ERROR BANNER ── */
+  #error-banner {
+    display: none; background: #2a1010; border: 1px solid var(--red);
+    color: #fca5a5; font-size: 12px; font-family: var(--font-mono);
+    padding: 8px 16px; text-align: center; flex-shrink: 0;
+  }
+  #error-banner.show { display: block; }
+
   @media (max-width: 480px) {
     #quickbar { padding: 8px 12px; }
     #chat { padding: 14px 10px; }
@@ -488,18 +293,11 @@
     .msg { max-width: 95%; }
     .bubble { font-size: 13.5px; }
   }
-
-  /* Scrollbar for webkit */
-  @media (min-width: 600px) {
-    #chat::-webkit-scrollbar { width: 6px; }
-  }
 </style>
 </head>
 <body>
 
 <div id="app">
-
-  <!-- HEADER -->
   <header>
     <div class="logo-mark">
       <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>
@@ -508,10 +306,14 @@
       <div class="header-title">AutoFlex OEM</div>
       <div class="header-sub">Consulta de peças · Catálogo inteligente</div>
     </div>
-    <div class="status-dot" title="Agente online"></div>
+    <span id="status-label">online</span>
+    <div class="status-dot" id="status-dot"></div>
   </header>
 
-  <!-- QUICK COMMANDS -->
+  <div id="error-banner" id="error-banner">
+    ⚠️ Sem conexão com o servidor. Verifique se <code>python backend.py</code> está rodando na porta 5000.
+  </div>
+
   <div id="quickbar">
     <div class="qchip" onclick="sendQuick('/ajuda')">📖 Ajuda</div>
     <div class="qchip" onclick="sendQuick('/historico')">🕐 Histórico</div>
@@ -521,56 +323,43 @@
     <div class="qchip" onclick="sendQuick('/limpar')">🗑️ Limpar</div>
   </div>
 
-  <!-- CHAT -->
-  <div id="chat">
-    <!-- Welcome message injected by JS -->
-  </div>
+  <div id="chat"></div>
 
-  <!-- INPUT AREA -->
   <div id="input-area">
-    <!-- Image preview strip -->
     <div id="img-preview-wrap">
       <img id="img-preview-thumb" src="" alt="preview">
       <span id="img-preview-name">imagem.jpg</span>
       <button id="img-preview-remove" onclick="clearImage()" title="Remover">✕</button>
     </div>
-
     <div class="input-row">
-      <!-- Attach from gallery -->
       <button class="icon-btn" title="Enviar foto da galeria" onclick="document.getElementById('file-input').click()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/>
           <polyline points="21 15 16 10 5 21"/>
         </svg>
       </button>
-
-      <!-- Open camera -->
       <button class="icon-btn" title="Tirar foto com câmera" onclick="openCamera()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/>
           <circle cx="12" cy="13" r="4"/>
         </svg>
       </button>
-
       <textarea id="user-input"
         placeholder="Ex: cabo embreagem palio 2006, OEM 55204912…"
         rows="1"
         onkeydown="handleKey(event)"
         oninput="autoResize(this)"
       ></textarea>
-
-      <button id="send-btn" onclick="sendMessage()" title="Enviar">
+      <button id="send-btn" onclick="sendMessage()">
         <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
       </button>
     </div>
   </div>
 </div>
 
-<!-- Hidden file inputs -->
 <input type="file" id="file-input" accept="image/*" onchange="handleFileSelect(event)">
 <input type="file" id="camera-file-input" accept="image/*" capture="environment" onchange="handleFileSelect(event)">
 
-<!-- CAMERA MODAL (fallback for desktop) -->
 <div id="camera-modal">
   <video id="camera-video" autoplay playsinline muted></video>
   <canvas id="snap-canvas" style="display:none"></canvas>
@@ -580,41 +369,86 @@
   </div>
 </div>
 
-<!-- TOAST -->
 <div id="toast"></div>
 
 <script>
 // ─────────────────────────────────────────────
-//  STATE
+//  CONFIG
 // ─────────────────────────────────────────────
-const API_URL = '/chat'; // Change to your backend endpoint
-let pendingImage = null;  // { file, dataUrl, name }
-let mediaStream = null;
-let isWaiting = false;
+
+// Quando o HTML é servido pelo próprio Flask (python backend.py),
+// o navegador já está em http://localhost:5000 e '/chat' funciona.
+// Se abrir o HTML diretamente como arquivo (file://), aponta para localhost:5000.
+const API_BASE = window.location.protocol === 'file:'
+  ? 'http://localhost:5000'
+  : '';                          // mesma origem → sem prefixo
+const API_URL  = API_BASE + '/chat';
+const PING_URL = API_BASE + '/ping';
+
+let pendingImage = null;
+let mediaStream  = null;
+let isWaiting    = false;
+let serverOk     = null;  // null = não testado ainda
 
 // ─────────────────────────────────────────────
 //  INIT
 // ─────────────────────────────────────────────
-window.addEventListener('DOMContentLoaded', () => {
-  addBotMessage(`🔧 *Bem-vindo ao AutoFlex OEM*
-
-Sou seu assistente de catálogo de peças. Você pode buscar por:
-
-• Descrição → *cabo embreagem palio 2006*
-• Código SKU → *4002*
-• Referência OEM → *oem 55204912*
-• Foto da peça → use os botões 📷 ou 🖼️
-
-Como posso ajudar?`, true);
+window.addEventListener('DOMContentLoaded', async () => {
+  addBotMessage(
+    `🔧 *Bem-vindo ao AutoFlex OEM*\n\n` +
+    `Sou seu assistente de catálogo de peças. Você pode buscar por:\n\n` +
+    `• Descrição → *cabo embreagem palio 2006*\n` +
+    `• Código SKU → *4002*\n` +
+    `• Referência OEM → *oem 55204912*\n` +
+    `• Foto da peça → use os botões 📷 ou 🖼️\n\n` +
+    `Como posso ajudar?`,
+    true
+  );
   document.getElementById('user-input').focus();
+  await checkServer();
 });
+
+// ─────────────────────────────────────────────
+//  SERVER HEALTH CHECK
+// ─────────────────────────────────────────────
+async function checkServer() {
+  try {
+    const r = await fetch(PING_URL, { method: 'GET' });
+    if (r.ok) {
+      const d = await r.json();
+      setServerStatus(true, `${d.pecas?.toLocaleString('pt-BR') || '?'} peças`);
+      return true;
+    }
+  } catch (_) {}
+  setServerStatus(false);
+  return false;
+}
+
+function setServerStatus(ok, info = '') {
+  serverOk = ok;
+  const dot    = document.getElementById('status-dot');
+  const label  = document.getElementById('status-label');
+  const banner = document.getElementById('error-banner');
+  if (ok) {
+    dot.style.background    = '#22c55e';
+    dot.style.boxShadow     = '0 0 8px #22c55e';
+    label.textContent       = info || 'online';
+    label.style.color       = 'var(--text-mid)';
+    banner.classList.remove('show');
+  } else {
+    dot.style.background    = '#ef4444';
+    dot.style.boxShadow     = '0 0 8px #ef4444';
+    label.textContent       = 'offline';
+    label.style.color       = '#ef4444';
+    banner.classList.add('show');
+  }
+}
 
 // ─────────────────────────────────────────────
 //  MESSAGE RENDERING
 // ─────────────────────────────────────────────
 function addBotMessage(text, isWelcome = false) {
   const chat = document.getElementById('chat');
-
   const wrap = document.createElement('div');
   wrap.className = 'msg bot';
 
@@ -627,33 +461,35 @@ function addBotMessage(text, isWelcome = false) {
   bubble.className = 'bubble';
   bubble.innerHTML = renderText(text);
 
-  // If it has numbered options, add quick option buttons
-  const optMatches = [...text.matchAll(/^(\d)[️⃣]?\s+(.+)/gm)];
-  if (optMatches.length >= 2 && !isWelcome) {
-    const optRow = document.createElement('div');
-    optRow.className = 'option-row';
-    optMatches.slice(0, 9).forEach(m => {
-      const btn = document.createElement('button');
-      btn.className = 'opt-btn';
-      btn.textContent = m[1];
-      btn.onclick = () => sendQuick(m[1]);
-      optRow.appendChild(btn);
-    });
-    bubble.appendChild(optRow);
-  }
+  // Botões para lista numerada (1️⃣…9️⃣)
+  if (!isWelcome) {
+    const optMatches = [...text.matchAll(/^(\d)[️⃣\s]/gm)];
+    if (optMatches.length >= 2) {
+      const row = document.createElement('div');
+      row.className = 'option-row';
+      optMatches.slice(0, 9).forEach(m => {
+        const btn = document.createElement('button');
+        btn.className = 'opt-btn';
+        btn.textContent = m[1];
+        btn.onclick = () => sendQuick(m[1]);
+        row.appendChild(btn);
+      });
+      bubble.appendChild(row);
+    }
 
-  // Post-detail action buttons
-  if (text.includes('1️⃣ aplicação') || text.includes('1️⃣ aplicação completa')) {
-    const optRow = document.createElement('div');
-    optRow.className = 'option-row';
-    [['1', '📋 Aplicação'], ['2', '🔍 Similares'], ['3', '🔄 Nova busca']].forEach(([v, label]) => {
-      const btn = document.createElement('button');
-      btn.className = 'opt-btn';
-      btn.textContent = label;
-      btn.onclick = () => sendQuick(v);
-      optRow.appendChild(btn);
-    });
-    bubble.appendChild(optRow);
+    // Botões do menu de detalhe (1️⃣ aplicação …)
+    if (text.includes('1️⃣ aplicação') || text.includes('1, 2 ou 3')) {
+      const row = document.createElement('div');
+      row.className = 'option-row';
+      [['1','📋 Aplicação'],['2','🔍 Similares'],['3','🔄 Nova busca']].forEach(([v, lbl]) => {
+        const btn = document.createElement('button');
+        btn.className = 'opt-btn';
+        btn.textContent = lbl;
+        btn.onclick = () => sendQuick(v);
+        row.appendChild(btn);
+      });
+      bubble.appendChild(row);
+    }
   }
 
   wrap.appendChild(bubble);
@@ -675,14 +511,10 @@ function addUserMessage(text, imageDataUrl = null) {
   bubble.className = 'bubble';
   if (imageDataUrl) {
     const img = document.createElement('img');
-    img.src = imageDataUrl;
-    img.alt = 'foto da peça';
+    img.src = imageDataUrl; img.alt = 'foto da peça';
     bubble.appendChild(img);
   }
-  if (text) {
-    const t = document.createTextNode(text);
-    bubble.appendChild(t);
-  }
+  if (text) bubble.appendChild(document.createTextNode(text));
   wrap.appendChild(bubble);
   chat.appendChild(wrap);
   scrollBottom();
@@ -691,48 +523,39 @@ function addUserMessage(text, imageDataUrl = null) {
 function addTyping() {
   const chat = document.getElementById('chat');
   const wrap = document.createElement('div');
-  wrap.className = 'msg bot';
-  wrap.id = 'typing-wrap';
-
+  wrap.className = 'msg bot'; wrap.id = 'typing-wrap';
   const label = document.createElement('div');
-  label.className = 'msg-label';
-  label.textContent = 'AUTOFLEX';
+  label.className = 'msg-label'; label.textContent = 'AUTOFLEX';
   wrap.appendChild(label);
-
   const ind = document.createElement('div');
   ind.className = 'typing-indicator';
   ind.innerHTML = '<span></span><span></span><span></span>';
   wrap.appendChild(ind);
-
   chat.appendChild(wrap);
   scrollBottom();
 }
-
 function removeTyping() {
   const el = document.getElementById('typing-wrap');
   if (el) el.remove();
 }
 
 function renderText(text) {
-  // Bold with *word*
   return text
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/\*(.*?)\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br>');
 }
-
 function scrollBottom() {
-  const chat = document.getElementById('chat');
-  chat.scrollTop = chat.scrollHeight;
+  const c = document.getElementById('chat');
+  c.scrollTop = c.scrollHeight;
 }
 
 // ─────────────────────────────────────────────
-//  SEND
+//  SEND MESSAGE
 // ─────────────────────────────────────────────
 async function sendMessage() {
   if (isWaiting) return;
-  const inp = document.getElementById('user-input');
+  const inp  = document.getElementById('user-input');
   const text = inp.value.trim();
   if (!text && !pendingImage) return;
 
@@ -741,83 +564,54 @@ async function sendMessage() {
   inp.value = '';
   autoResize(inp);
 
-  // Build payload
-  let payload;
-  if (pendingImage) {
-    // Multipart approach — adjust based on your backend
-    payload = new FormData();
-    payload.append('message', text || `busca imagem: peça na foto`);
-    payload.append('image', pendingImage.file, pendingImage.name);
-  } else {
-    payload = JSON.stringify({ message: text });
-  }
+  const formData = new FormData();
+  if (text) formData.append('message', text);
+  if (pendingImage) formData.append('image', pendingImage.file, pendingImage.name);
+  // Se só tem imagem, manda um texto genérico para o backend não reclamar
+  if (!text && pendingImage) formData.set('message', 'busca imagem');
 
   clearImage();
   setWaiting(true);
   addTyping();
 
   try {
-    const resp = await callBackend(payload, !!pendingImage);
+    const resp = await fetch(API_URL, {
+      method:      'POST',
+      body:        formData,
+      credentials: 'include',   // necessário para cookie de sessão
+    });
+
     removeTyping();
-    addBotMessage(resp);
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      addBotMessage(`❌ Erro ${resp.status}: ${err.error || resp.statusText}`);
+      return;
+    }
+
+    const data = await resp.json();
+    addBotMessage(data.response || '(resposta vazia)');
+    // Atualiza status se estava offline
+    if (!serverOk) setServerStatus(true);
+
   } catch (err) {
     removeTyping();
-    addBotMessage(`❌ Erro ao conectar com o agente.\n\nVerifique se o servidor está rodando e tente novamente.\n\nDetalhes: ${err.message}`);
+    setServerStatus(false);
+
+    // Mensagem de erro amigável
+    addBotMessage(
+      `❌ *Não foi possível conectar ao servidor.*\n\n` +
+      `Verifique se o backend está rodando:\n` +
+      `  → abra um terminal na pasta do projeto\n` +
+      `  → execute: *python backend.py*\n\n` +
+      `O servidor deve estar em http://localhost:5000\n\n` +
+      `Detalhe técnico: ${err.message}`
+    );
   } finally {
     setWaiting(false);
   }
 }
 
-// ─────────────────────────────────────────────
-//  BACKEND CALL — Adjust to your Flask/FastAPI
-// ─────────────────────────────────────────────
-async function callBackend(payload, isFormData) {
-  // ── DEMO MODE ──
-  // Remove this block and uncomment the real fetch below
-  await sleep(900 + Math.random() * 600);
-  return demoResponse(isFormData ? '[imagem enviada]' : JSON.parse(payload).message);
-
-  // ── REAL BACKEND ── uncomment when ready:
-  // const opts = isFormData
-  //   ? { method: 'POST', body: payload }
-  //   : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload };
-  // const r = await fetch(API_URL, opts);
-  // if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  // const data = await r.json();
-  // return data.response || data.message || JSON.stringify(data);
-}
-
-// Demo responses for testing the UI without backend
-function demoResponse(query) {
-  const q = query.toLowerCase();
-  if (q.includes('imagem') || q.includes('[imagem')) {
-    return `🔍 Imagem recebida! Identificando peça com Gemini Flash...\n\nPeça identificada: *Cabo de embreagem*\n\nBuscando no catálogo...`;
-  }
-  if (q.includes('ajuda') || q.includes('/ajuda')) {
-    return `Você pode buscar assim:\n\n• cabo embreagem palio 2006\n• palio 2008\n• 4002\n• oem 55204912\n• /imagem /caminho/foto.jpg\n\nApós uma lista, responda com:\n• número da opção\n• SKU  •  OEM\n\nApós os detalhes, digite:\n1️⃣ aplicação completa\n2️⃣ peças similares\n3️⃣ nova busca`;
-  }
-  if (q.includes('palio') || q.includes('cabo') || q.includes('embreagem')) {
-    return `Encontrei 3 opção(ões):\n\n1️⃣ Cabo Embreagem Palio\nSKU: AF-4002 | OEM: 55204912 | Ano: 2003 - 2012\n\n2️⃣ Cabo Embreagem Siena\nSKU: AF-4003 | OEM: 55204913 | Ano: 2001 - 2010\n\n3️⃣ Cabo Embreagem Strada\nSKU: AF-4004 | OEM: 55204914 | Ano: 2004 - 2014\n\nResponda com o número, SKU, OEM ou mande uma nova busca.`;
-  }
-  if (q === '1' || q === '2' || q === '3') {
-    const actions = {
-      '1': `Aplicação encontrada:\n\n• Palio 2003-2012 | 1.0 8v\n• Palio 2003-2012 | 1.4 8v\n• Palio Fire 2004-2012 | 1.0\n• Siena 2003-2010 | 1.4\n\nDigite 1, 2 ou 3 para continuar.`,
-      '2': `Encontrei 2 opção(ões) similares:\n\n1️⃣ Cabo Embreagem Uno\nSKU: AF-4001 | OEM: 55204910 | Ano: 1998 - 2013\n\n2️⃣ Cabo Embreagem Fiorino\nSKU: AF-4005 | OEM: 55204915 | Ano: 2000 - 2011\n\nResponda com o número, SKU, OEM ou mande uma nova busca.`,
-      '3': `🔍 Nova busca. Digite o que deseja.`,
-    };
-    return actions[q] || 'Opção não reconhecida.';
-  }
-  if (q.match(/^\d+$/) && parseInt(q) <= 9) {
-    return `✅ Peça encontrada\n\n🔧 *Cabo Embreagem Palio*\n\nSKU Autoflex: AF-4002\nOEM / Referência: 55204912\nMontadora: FIAT\nGrupo: Transmissão\nAplicação: Palio 1.0 / 1.4 8v\nModelo: Palio\nMotor/versão: 1.0 8v / 1.4 8v\nAno: 2003 até 2012\n\nVocê pode pedir:\n1️⃣ aplicação completa\n2️⃣ peças similares\n3️⃣ nova busca`;
-  }
-  return `Não encontrei uma peça com essa busca.\n\nBusca feita: ${query}\n\nTente assim:\n• cabo embreagem palio 2006\n• 4002\n• oem 55204912\n• amortecedor uno`;
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// ─────────────────────────────────────────────
-//  QUICK SEND
-// ─────────────────────────────────────────────
 function sendQuick(text) {
   const inp = document.getElementById('user-input');
   inp.value = text;
@@ -831,56 +625,40 @@ function setWaiting(val) {
   isWaiting = val;
   document.getElementById('send-btn').disabled = val;
 }
-
 function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 }
-
 function autoResize(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
-
 function showToast(msg, duration = 2500) {
   const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
+  t.textContent = msg; t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), duration);
 }
 
 // ─────────────────────────────────────────────
-//  IMAGE HANDLING
+//  IMAGE
 // ─────────────────────────────────────────────
 function handleFileSelect(event) {
   const file = event.target.files[0];
   if (!file) return;
-  if (!file.type.startsWith('image/')) {
-    showToast('❌ Selecione uma imagem válida');
-    return;
-  }
-  if (file.size > 10 * 1024 * 1024) {
-    showToast('❌ Imagem muito grande (máx. 10MB)');
-    return;
-  }
+  if (!file.type.startsWith('image/')) { showToast('❌ Selecione uma imagem válida'); return; }
+  if (file.size > 10 * 1024 * 1024)   { showToast('❌ Imagem muito grande (máx. 10MB)'); return; }
   const reader = new FileReader();
   reader.onload = e => setImagePreview(file, e.target.result);
   reader.readAsDataURL(file);
   event.target.value = '';
 }
-
 function setImagePreview(file, dataUrl) {
   pendingImage = { file, dataUrl, name: file.name };
-  const wrap = document.getElementById('img-preview-wrap');
   document.getElementById('img-preview-thumb').src = dataUrl;
   document.getElementById('img-preview-name').textContent = file.name;
-  wrap.classList.add('visible');
+  document.getElementById('img-preview-wrap').classList.add('visible');
   document.getElementById('user-input').placeholder = 'Descrição adicional (opcional)…';
   document.getElementById('user-input').focus();
 }
-
 function clearImage() {
   pendingImage = null;
   document.getElementById('img-preview-wrap').classList.remove('visible');
@@ -891,42 +669,28 @@ function clearImage() {
 //  CAMERA
 // ─────────────────────────────────────────────
 function openCamera() {
-  // On mobile, use native capture; on desktop, open modal
   const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
-  if (isMobile) {
-    document.getElementById('camera-file-input').click();
-    return;
-  }
-  // Desktop: use getUserMedia modal
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showToast('📷 Câmera não disponível neste navegador');
-    return;
-  }
+  if (isMobile) { document.getElementById('camera-file-input').click(); return; }
+  if (!navigator.mediaDevices?.getUserMedia) { showToast('📷 Câmera não disponível neste navegador'); return; }
   navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
     .then(stream => {
       mediaStream = stream;
-      const video = document.getElementById('camera-video');
-      video.srcObject = stream;
+      document.getElementById('camera-video').srcObject = stream;
       document.getElementById('camera-modal').classList.add('open');
     })
-    .catch(() => {
-      showToast('❌ Permissão de câmera negada');
-    });
+    .catch(() => showToast('❌ Permissão de câmera negada'));
 }
-
 function closeCamera() {
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
   document.getElementById('camera-modal').classList.remove('open');
 }
-
 function snapPhoto() {
-  const video = document.getElementById('camera-video');
+  const video  = document.getElementById('camera-video');
   const canvas = document.getElementById('snap-canvas');
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
   canvas.getContext('2d').drawImage(video, 0, 0);
   canvas.toBlob(blob => {
-    const file = new File([blob], `foto_peca_${Date.now()}.jpg`, { type: 'image/jpeg' });
+    const file    = new File([blob], `foto_peca_${Date.now()}.jpg`, { type: 'image/jpeg' });
     const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
     setImagePreview(file, dataUrl);
     closeCamera();
@@ -934,9 +698,13 @@ function snapPhoto() {
   }, 'image/jpeg', 0.85);
 }
 
-// Close camera modal on backdrop click
 document.getElementById('camera-modal').addEventListener('click', function(e) {
   if (e.target === this) closeCamera();
+});
+
+// Reconecta quando a aba voltar ao foco
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && !serverOk) checkServer();
 });
 </script>
 </body>
