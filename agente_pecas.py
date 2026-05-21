@@ -198,10 +198,19 @@ def obter_modelos_conhecidos():
 def extrair_termos_modelo_ano(texto):
     texto = texto.lower().strip()
     ignorar = {
-        "quero", "preciso", "procuro", "tem", "vc", "voce", "você",
-        "me", "manda", "ver", "uma", "um", "o", "a", "os", "as",
-        "de", "do", "da", "dos", "das", "para", "pra", "com",
-        "peça", "peca", "produto"
+       "quero","preciso","procuro","tem","vc","voce",
+    "você","me","manda","ver","uma","um","o","a",
+    "os","as","de","do","da","dos","das","para",
+    "pra","com","peca","peça","produto",
+
+    # termos genéricos automotivos
+    "kit",
+    "completo",
+    "completa",
+    "dianteiro",
+    "dianteira",
+    "traseiro",
+    "traseira",
     }
     modelos = obter_modelos_conhecidos()
     modelo = None
@@ -324,9 +333,47 @@ def buscar_por_veiculo(modelo=None, ano=None, termos=None):
         }
         if termos:
             desc = peca["descricao"].lower()
-            if not any(t in desc for t in termos):
-                continue
+
+            termos_relevantes = [
+                t for t in termos
+                if len(t) > 3
+            ]
+
+            matches = sum(
+                1 for t in termos_relevantes
+                if t in desc
+            )
+
+            # exige pelo menos 2 matches
+            if len(termos_relevantes) >= 2:
+                if matches < 2:
+                    continue
+
+            # se só tiver 1 termo relevante
+            elif termos_relevantes:
+                if matches < 1:
+                    continue
+             
+        score_extra = 0
+
+        if "marcha" in termos and "marcha" in desc:
+            score_extra += 20
+
+        if "embreagem" in termos and "embreagem" in desc:
+            score_extra += 20
+
+        if "freio" in termos and "freio" in desc:
+            score_extra += 20
+
+        peca["score"] = matches + score_extra
+
         pecas.append(peca)
+        
+        pecas.sort(
+            key=lambda x: x.get("score", 0),
+            reverse=True
+        )
+        
     return pecas[:10]
 
 def buscar_por_descricao(termos, modelo=None, ano=None):
@@ -361,7 +408,7 @@ def buscar_fuzzy(consulta, limite=10):
             fuzz.token_sort_ratio(consulta, texto),
             fuzz.token_set_ratio(consulta, texto)
         )
-        if score >= 65:
+        if score >= 78:
             resultados.append({
                 "score": score,
                 "sku": str(row.get("SKU Autoflex", "")).strip(),
