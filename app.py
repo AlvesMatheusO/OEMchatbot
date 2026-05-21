@@ -627,9 +627,10 @@ def ping():
 
 # ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
     print("="*60)
-    print("🚀  AutoFlex Backend  →  http://localhost:5000")
+    print(f"🚀  AutoFlex Backend  →  http://localhost:{port}")
     print(f"🤖  Gemini visão:       {MODELO_VISAO or 'não configurado'}")
     print("📦  Sessões em memória, chave = IP do cliente.")
     print("="*60)
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
