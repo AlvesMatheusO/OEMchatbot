@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from rapidfuzz import fuzz
 
 # ── Gemini opcional ───────────────────────────────────────────
-GEMINI_OK    = False
+GEMINI_OK     = False
 cliente_genai = None
 MODELO_VISAO  = None
 
@@ -35,7 +35,6 @@ EXCEL_PATH     = BASE_DIR / "data" / "CATALOGO_AUTOFLEX_BD_v1-3.xlsx"
 DB_PATH        = BASE_DIR / "autoflex_catalog.db"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Modelos candidatos em ordem de preferência
 MODELOS_CANDIDATOS = [
     "gemini-2.0-flash",
     "gemini-1.5-flash",
@@ -45,14 +44,12 @@ MODELOS_CANDIDATOS = [
 ]
 
 def _init_gemini():
-    """Tenta cada modelo candidato e retorna o primeiro que funcionar."""
     global cliente_genai, MODELO_VISAO
     if not GEMINI_OK or not GEMINI_API_KEY:
         print("⚠️  Gemini não configurado (sem GEMINI_API_KEY ou sem google-genai instalado).")
         return
     try:
         cliente_genai = genai.Client(api_key=GEMINI_API_KEY)
-        # descobre modelos disponíveis
         disponiveis = {m.name.split("/")[-1] for m in cliente_genai.models.list()}
         print(f"   Modelos disponíveis: {sorted(disponiveis)}")
         for cand in MODELOS_CANDIDATOS:
@@ -60,7 +57,6 @@ def _init_gemini():
                 MODELO_VISAO = cand
                 print(f"✅ Gemini pronto  →  modelo: {MODELO_VISAO}")
                 return
-        # nenhum candidato disponível — usa o primeiro da lista mesmo
         MODELO_VISAO = MODELOS_CANDIDATOS[0]
         print(f"⚠️  Nenhum modelo preferido disponível; tentando {MODELO_VISAO} assim mesmo.")
     except Exception as e:
@@ -68,8 +64,10 @@ def _init_gemini():
 
 _init_gemini()
 
-# ── Flask ─────────────────────────────────────────────────────
-app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "templates"))
+# ── Flask — serve arquivos estáticos da raiz do projeto ───────
+app = Flask(__name__,
+            template_folder=str(BASE_DIR),
+            static_folder=str(BASE_DIR))
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 CORS(app, supports_credentials=True)
 
@@ -477,17 +475,10 @@ def _ajuda():
 
 # ── Gemini: reconhecimento de imagem ─────────────────────────
 def reconhecer_imagem(file_storage) -> tuple[str, str]:
-    """
-    Retorna (descricao, erro).
-    - descricao: peça identificada (vazia se falhou)
-    - erro: mensagem amigável (vazia se sucesso)
-    Faz até 3 tentativas com backoff automático em caso de rate-limit (429).
-    """
     if not cliente_genai or not MODELO_VISAO:
         return "", ("Reconhecimento por imagem não configurado. "
                     "Adicione GEMINI_API_KEY no arquivo .env e reinicie o servidor.")
 
-    # lê bytes uma única vez (FileStorage não permite re-leitura)
     img_bytes = file_storage.read()
     try:
         img = PILImage.open(BytesIO(img_bytes))
@@ -512,18 +503,14 @@ def reconhecer_imagem(file_storage) -> tuple[str, str]:
                 model=MODELO_VISAO, contents=[prompt, img])
             descricao = resp.text.strip()
             print(f"   Gemini identificou: {descricao!r}")
-
             if not descricao or "não identificado" in descricao.lower():
                 return "", ("Não consegui identificar a peça na imagem. "
                             "Tente uma foto mais próxima e com boa iluminação, "
                             "ou descreva a peça em texto.")
             return descricao, ""
-
         except Exception as e:
             err_str = str(e)
             print(f"⚠️  Gemini erro (tentativa {tentativa}/{MAX_TENTATIVAS}): {err_str[:300]}")
-
-            # ── 429 rate-limit: espera retryDelay e tenta de novo ──
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 m_delay = re.search(r"retryDelay[\W]+(\d+)", err_str)
                 delay   = int(m_delay.group(1)) + 2 if m_delay else 35
@@ -534,26 +521,29 @@ def reconhecer_imagem(file_storage) -> tuple[str, str]:
                 return "", (f"⏳ Limite de uso gratuito do Gemini atingido. "
                             f"Aguarde ~{delay}s e tente novamente, "
                             "ou descreva a peça em texto.")
-
-            # erros sem retry
             if "404" in err_str or "NOT_FOUND" in err_str:
                 return "", (f"Modelo Gemini indisponível ({MODELO_VISAO}). "
                             "Verifique sua chave de API e reinicie o servidor.")
             if "403" in err_str or "API_KEY" in err_str.upper():
                 return "", "Chave GEMINI_API_KEY inválida ou sem permissão. Verifique o .env."
-
             return "", f"Erro no reconhecimento: {err_str[:120]}"
 
     return "", "Falha após múltiplas tentativas. Tente novamente mais tarde."
 
 # ── Rotas ─────────────────────────────────────────────────────
+# Servindo index.html diretamente da raiz do projeto (sem pasta templates/)
+ARQUIVOS_PERMITIDOS = {"index.html", "favicon.ico"}
+
 @app.route("/")
 def index():
-    return send_from_directory(str(BASE_DIR / "templates"), "index.html")
+    return send_from_directory(str(BASE_DIR), "index.html")
 
 @app.route("/<path:filename>")
 def static_files(filename):
-    return send_from_directory(str(BASE_DIR / "templates"), filename)
+    # permite apenas arquivos explicitamente listados para não expor código-fonte
+    if filename not in ARQUIVOS_PERMITIDOS:
+        return "", 404
+    return send_from_directory(str(BASE_DIR), filename)
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -571,32 +561,23 @@ def chat():
         mensagem = request.form.get("message","").strip()
         imagem   = request.files.get("image")
 
-    # ── processamento de imagem ───────────────────────────────
-    # "busca imagem" é o texto genérico enviado pelo frontend quando
-    # o usuário manda só a foto sem digitar nada — não serve como busca.
     MSG_GENERICA = {"busca imagem", "busca por imagem", "identificar peça por imagem"}
     texto_e_generico = mensagem.lower().strip() in MSG_GENERICA
 
     if imagem and imagem.filename:
         desc, erro = reconhecer_imagem(imagem)
-
         if erro:
             if texto_e_generico or not mensagem:
-                # sem texto útil do usuário → devolve só o erro
                 return jsonify({"response": f"📷 {erro}"})
             else:
-                # tem texto real do usuário → loga e continua com ele
                 print(f"   Imagem falhou; usando texto do usuário: {mensagem!r}")
-
         elif desc:
-            # Gemini identificou → combina com texto real do usuário (se houver)
             if mensagem and not texto_e_generico:
                 mensagem = f"{desc} {mensagem}"
             else:
                 mensagem = desc
             print(f"   Busca por imagem: {mensagem!r}")
 
-    # descarta texto genérico se não veio imagem com sucesso
     if texto_e_generico:
         return jsonify({"response": "📷 Envie uma imagem junto com a mensagem para usar a busca por foto."}), 200
 
@@ -627,9 +608,10 @@ def ping():
 
 # ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
     print("="*60)
-    print("🚀  AutoFlex Backend  →  http://localhost:5000")
+    print(f"🚀  AutoFlex Backend  →  http://localhost:{port}")
     print(f"🤖  Gemini visão:       {MODELO_VISAO or 'não configurado'}")
     print("📦  Sessões em memória, chave = IP do cliente.")
     print("="*60)
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
