@@ -69,7 +69,7 @@ def _init_gemini():
 _init_gemini()
 
 # ── Flask ─────────────────────────────────────────────────────
-app = Flask(__name__, template_folder="templates", static_folder="templates")
+app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "templates"))
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 CORS(app, supports_credentials=True)
 
@@ -549,11 +549,11 @@ def reconhecer_imagem(file_storage) -> tuple[str, str]:
 # ── Rotas ─────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return send_from_directory("templates","index.html")
+    return send_from_directory(str(BASE_DIR / "templates"), "index.html")
 
 @app.route("/<path:filename>")
 def static_files(filename):
-    return send_from_directory("templates",filename)
+    return send_from_directory(str(BASE_DIR / "templates"), filename)
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -627,10 +627,9 @@ def ping():
 
 # ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
     print("="*60)
-    print(f"🚀  AutoFlex Backend  →  http://localhost:{port}")
+    print("🚀  AutoFlex Backend  →  http://localhost:5000")
     print(f"🤖  Gemini visão:       {MODELO_VISAO or 'não configurado'}")
     print("📦  Sessões em memória, chave = IP do cliente.")
     print("="*60)
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
