@@ -1,3 +1,9 @@
+flask
+flask-cors
 pandas
 openpyxl
-sqlite3  
+rapidfuzz
+python-dotenv
+google-genai
+Pillow
+gunicorn
