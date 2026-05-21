@@ -4,7 +4,7 @@ Backend Flask – Assistente de Peças OEM
 Estado em memória, chave = IP do cliente (sem cookie, sem arquivo).
 """
 
-import os, re, sys, sqlite3, uuid
+import os, re, sys, sqlite3, time
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -15,51 +15,72 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from rapidfuzz import fuzz
 
+# ── Gemini opcional ───────────────────────────────────────────
+GEMINI_OK    = False
+cliente_genai = None
+MODELO_VISAO  = None
+
 try:
     from google import genai
     from PIL import Image as PILImage
     GEMINI_OK = True
 except ImportError:
-    GEMINI_OK = False
+    pass
 
-# ============================================================
-# CONFIG
-# ============================================================
+# ── Config ────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-EXCEL_PATH = BASE_DIR / "data" / "CATALOGO_AUTOFLEX_BD_v1-3.xlsx"
-DB_PATH    = BASE_DIR / "autoflex_catalog.db"
-
+EXCEL_PATH     = BASE_DIR / "data" / "CATALOGO_AUTOFLEX_BD_v1-3.xlsx"
+DB_PATH        = BASE_DIR / "autoflex_catalog.db"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-cliente_genai  = None
-MODELO_VISAO   = None
-if GEMINI_OK and GEMINI_API_KEY:
+
+# Modelos candidatos em ordem de preferência
+MODELOS_CANDIDATOS = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro",
+    "gemini-1.5-pro-latest",
+]
+
+def _init_gemini():
+    """Tenta cada modelo candidato e retorna o primeiro que funcionar."""
+    global cliente_genai, MODELO_VISAO
+    if not GEMINI_OK or not GEMINI_API_KEY:
+        print("⚠️  Gemini não configurado (sem GEMINI_API_KEY ou sem google-genai instalado).")
+        return
     try:
         cliente_genai = genai.Client(api_key=GEMINI_API_KEY)
-        MODELO_VISAO  = "gemini-2.0-flash-exp"
-        print("✅ Gemini pronto.")
+        # descobre modelos disponíveis
+        disponiveis = {m.name.split("/")[-1] for m in cliente_genai.models.list()}
+        print(f"   Modelos disponíveis: {sorted(disponiveis)}")
+        for cand in MODELOS_CANDIDATOS:
+            if cand in disponiveis:
+                MODELO_VISAO = cand
+                print(f"✅ Gemini pronto  →  modelo: {MODELO_VISAO}")
+                return
+        # nenhum candidato disponível — usa o primeiro da lista mesmo
+        MODELO_VISAO = MODELOS_CANDIDATOS[0]
+        print(f"⚠️  Nenhum modelo preferido disponível; tentando {MODELO_VISAO} assim mesmo.")
     except Exception as e:
-        print(f"⚠️ Gemini: {e}")
+        print(f"⚠️  Falha ao inicializar Gemini: {e}")
 
-# ============================================================
-# FLASK
-# ============================================================
+_init_gemini()
+
+# ── Flask ─────────────────────────────────────────────────────
 app = Flask(__name__, template_folder="templates", static_folder="templates")
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 CORS(app, supports_credentials=True)
 
-# ============================================================
-# SESSÃO EM MEMÓRIA — chave = IP do cliente
-# ============================================================
+# ── Sessões em memória (chave = IP) ───────────────────────────
 _SESSIONS: dict = {}
 
-def _get_client_key():
-    """Usa X-Forwarded-For se disponível, senão remote_addr."""
+def _client_key():
     return request.headers.get("X-Forwarded-For", request.remote_addr) or "local"
 
 def get_sess():
-    key = _get_client_key()
+    key = _client_key()
     if key not in _SESSIONS:
         _SESSIONS[key] = estado_inicial()
     return key, _SESSIONS[key]
@@ -69,7 +90,7 @@ def save_sess(key, sess):
 
 def estado_inicial():
     return {
-        "estado": "livre",   # "livre" | "lista" | "detalhe"
+        "estado": "livre",
         "opcoes": [],
         "peca_atual": None,
         "ultimo_modelo": None,
@@ -78,9 +99,7 @@ def estado_inicial():
         "historico": [],
     }
 
-# ============================================================
-# EXCEL
-# ============================================================
+# ── Excel ─────────────────────────────────────────────────────
 print("🔄 Carregando catálogo…")
 try:
     df = pd.read_excel(EXCEL_PATH, sheet_name="Catálogo Mestre")
@@ -100,9 +119,7 @@ df["busca_texto"] = df.apply(
         ["SKU Autoflex","Código OEM","Descrição","Montadora","Grupo","Veículo"]).lower(),
     axis=1)
 
-# ============================================================
-# SQLITE
-# ============================================================
+# ── SQLite ────────────────────────────────────────────────────
 def init_db():
     c = sqlite3.connect(DB_PATH)
     c.executescript("""
@@ -141,9 +158,10 @@ def import_excel():
             sku = str(row.get("SKU","")).strip()
             cur.execute("SELECT 1 FROM products WHERE sku_autoflex=?", (sku,))
             if not cur.fetchone(): continue
-            ai, af, cf = row.get("Ano Início"), row.get("Ano Fim"), row.get("Confidence",0.6)
+            ai, af, cf = row.get("Ano Início"), row.get("Ano Fim"), row.get("Confidence", 0.6)
             cur.execute(
-                "INSERT INTO fitment (sku_autoflex,montadora,modelo,ano_inicio,ano_fim,motor_versao,confidence) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO fitment (sku_autoflex,montadora,modelo,ano_inicio,ano_fim,motor_versao,confidence)"
+                " VALUES (?,?,?,?,?,?,?)",
                 (sku, str(row.get("Montadora","")).strip(), str(row.get("Modelo","")).strip(),
                  int(ai) if pd.notna(ai) else None, int(af) if pd.notna(af) else None,
                  str(row.get("Motor/Versão","")).strip(), float(cf) if pd.notna(cf) else 0.6))
@@ -156,9 +174,7 @@ def import_excel():
 init_db()
 import_excel()
 
-# ============================================================
-# UTILITÁRIOS
-# ============================================================
+# ── Utilitários ───────────────────────────────────────────────
 def norm(s):
     return re.sub(r"[^a-zA-Z0-9]","",str(s)).lower()
 
@@ -166,7 +182,7 @@ def eh_codigo(t):
     t = t.strip()
     return bool(re.fullmatch(r"[a-zA-Z0-9\-.]{4,}", t)) and len(t.split())==1
 
-MODELOS = [
+MODELOS_VEICULO = [
     "palio","uno","strada","siena","punto","linea","idea","doblo","doblô",
     "argo","cronos","mobi","fiorino","gol","fox","voyage","saveiro","virtus",
     "onix","prisma","cobalt","spin","corsa","celta","agile","montana",
@@ -180,29 +196,29 @@ IGNORAR = {
 
 def extrair(texto):
     t = texto.lower().strip()
-    modelo = next((m for m in MODELOS if re.search(rf"\b{re.escape(m)}\b",t)), None)
+    modelo = next((m for m in MODELOS_VEICULO if re.search(rf"\b{re.escape(m)}\b",t)), None)
     ano_m  = re.search(r"\b(19|20)\d{2}\b", t)
     ano    = ano_m.group() if ano_m else None
     termos = [p for p in re.findall(r"[a-zA-ZÀ-ÿ0-9]+",t)
-              if p not in IGNORAR and p!=modelo and p!=ano and len(p)>2]
+              if p not in IGNORAR and p != modelo and p != ano and len(p) > 2]
     return termos, modelo, ano
 
-# ============================================================
-# BUSCAS
-# ============================================================
+# ── Buscas ────────────────────────────────────────────────────
 def row2p(r):
-    return {"sku":str(r[0]).strip(),"codigo_oem":str(r[1]).strip() if len(r)>1 else "",
-            "descricao":str(r[2]).strip() if len(r)>2 else "",
-            "veiculo":str(r[3]).strip() if len(r)>3 else "",
-            "montadora":str(r[4]).strip() if len(r)>4 else "",
-            "grupo":str(r[5]).strip() if len(r)>5 else "",
+    return {"sku":str(r[0]).strip(),
+            "codigo_oem":str(r[1]).strip() if len(r)>1 else "",
+            "descricao":str(r[2]).strip()  if len(r)>2 else "",
+            "veiculo":str(r[3]).strip()    if len(r)>3 else "",
+            "montadora":str(r[4]).strip()  if len(r)>4 else "",
+            "grupo":str(r[5]).strip()      if len(r)>5 else "",
             "ano_inicio":None,"ano_fim":None}
 
 def enrich(pecas):
     if not pecas: return pecas
     c = sqlite3.connect(DB_PATH); cur = c.cursor()
     for p in pecas:
-        cur.execute("SELECT ano_inicio,ano_fim FROM fitment WHERE sku_autoflex=? ORDER BY confidence DESC,ano_inicio LIMIT 1",(p["sku"],))
+        cur.execute("SELECT ano_inicio,ano_fim FROM fitment "
+                    "WHERE sku_autoflex=? ORDER BY confidence DESC,ano_inicio LIMIT 1",(p["sku"],))
         r = cur.fetchone()
         if r: p["ano_inicio"],p["ano_fim"] = r[0],r[1]
     c.close(); return pecas
@@ -224,10 +240,10 @@ def buscar_ref(texto):
 
 def buscar_veiculo(modelo, ano=None, termos=None):
     c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    q = """SELECT p.sku_autoflex,p.codigo_oem,p.descricao,p.veiculo,p.montadora,p.grupo,
-                  f.modelo,f.ano_inicio,f.ano_fim,f.motor_versao,f.confidence
-           FROM fitment f JOIN products p ON p.sku_autoflex=f.sku_autoflex
-           WHERE LOWER(f.modelo) LIKE ?"""
+    q = ("SELECT p.sku_autoflex,p.codigo_oem,p.descricao,p.veiculo,p.montadora,p.grupo,"
+         "f.modelo,f.ano_inicio,f.ano_fim,f.motor_versao,f.confidence "
+         "FROM fitment f JOIN products p ON p.sku_autoflex=f.sku_autoflex "
+         "WHERE LOWER(f.modelo) LIKE ?")
     params = [f"%{modelo.lower()}%"]
     if ano:
         q += " AND (f.ano_inicio<=? AND (f.ano_fim>=? OR f.ano_fim IS NULL))"
@@ -236,8 +252,9 @@ def buscar_veiculo(modelo, ano=None, termos=None):
     cur.execute(q,params); rows = cur.fetchall(); c.close()
     pecas = []
     for r in rows:
-        p = {"sku":str(r[0]).strip(),"codigo_oem":str(r[1]).strip(),"descricao":str(r[2]).strip(),
-             "veiculo":str(r[3]).strip(),"montadora":str(r[4]).strip(),"grupo":str(r[5]).strip(),
+        p = {"sku":str(r[0]).strip(),"codigo_oem":str(r[1]).strip(),
+             "descricao":str(r[2]).strip(),"veiculo":str(r[3]).strip(),
+             "montadora":str(r[4]).strip(),"grupo":str(r[5]).strip(),
              "modelo":str(r[6]).strip(),"ano_inicio":r[7],"ano_fim":r[8],
              "motor_versao":str(r[9]).strip(),"confidence":r[10]}
         if termos and not any(t in p["descricao"].lower() for t in termos): continue
@@ -272,9 +289,7 @@ def buscar_fuzzy(consulta, limite=10):
     res.sort(key=lambda x:x["score"],reverse=True)
     return enrich(res[:limite])
 
-# ============================================================
-# FORMATAÇÃO
-# ============================================================
+# ── Formatação ────────────────────────────────────────────────
 def v(val):
     s = str(val).strip() if val is not None else ""
     return "" if s.lower() in ("nan","none","null","") else s
@@ -311,9 +326,7 @@ def fmt_vazio(q):
     return (f"Não encontrei uma peça com essa busca.\n\nBusca feita: {q}\n\n"
             "Tente assim:\n• cabo embreagem palio 2006\n• 4002\n• oem 55204912\n• amortecedor uno")
 
-# ============================================================
-# LÓGICA CONVERSACIONAL
-# ============================================================
+# ── Lógica conversacional ─────────────────────────────────────
 def processar(consulta, sess):
     consulta = consulta.strip()
     if not consulta:
@@ -322,13 +335,11 @@ def processar(consulta, sess):
     cmd    = consulta.lower().strip()
     estado = sess.get("estado","livre")
 
-    # comandos globais
-    if cmd == "/ajuda":      return _ajuda(), sess
-    if cmd == "/historico":  return _historico(sess), sess
+    if cmd == "/ajuda":     return _ajuda(), sess
+    if cmd == "/historico": return _historico(sess), sess
     if cmd in ("/limpar","sair"):
         sess.update(estado_inicial()); return "Contexto limpo. Nova busca pronta.", sess
 
-    # ── estado detalhe: aguardando 1 / 2 / 3 ─────────────────
     if estado == "detalhe":
         peca = sess.get("peca_atual")
         if cmd == "1": return _aplicacao(peca), sess
@@ -336,28 +347,23 @@ def processar(consulta, sess):
         if cmd == "3":
             sess.update(estado_inicial())
             return "🔍 Nova busca. Digite o que deseja.", sess
-        # outra entrada → reinicia e reprocessa
         sess.update(estado_inicial())
         return processar(consulta, sess)
 
-    # ── estado lista: aguardando escolha ─────────────────────
     if estado == "lista":
-        opcoes = sess.get("opcoes", [])
+        opcoes = sess.get("opcoes",[])
         resp, sess = _tentar_escolha(cmd, opcoes, sess)
-        if resp is not None:
-            return resp, sess
-        # não foi escolha válida → reinicia e reprocessa
+        if resp is not None: return resp, sess
         sess.update(estado_inicial())
         return processar(consulta, sess)
 
-    # ── busca normal ──────────────────────────────────────────
     return _nova_busca(consulta, sess)
 
 def _nova_busca(consulta, sess):
     termos, modelo, ano = extrair(consulta)
     ult_m = sess.get("ultimo_modelo")
     ult_a = sess.get("ultimo_ano")
-    ult_t = sess.get("ultimos_termos", [])
+    ult_t = sess.get("ultimos_termos",[])
     if not modelo and ult_m and len(consulta.split()) <= 3: modelo = ult_m
     if not ano and ult_a and modelo: ano = ult_a
     if not termos and ult_t and modelo: termos = ult_t
@@ -402,7 +408,6 @@ def _tentar_escolha(cmd, opcoes, sess):
             sess["estado"]     = "detalhe"
             return fmt_detalhe(peca), sess
         return f"❌ Número inválido. Digite de 1 a {len(opcoes)}.", sess
-
     if eh_codigo(cmd):
         for p in opcoes:
             if norm(cmd) in [norm(p.get("sku","")), norm(p.get("codigo_oem",""))]:
@@ -418,14 +423,14 @@ def _tentar_escolha(cmd, opcoes, sess):
             sess["opcoes"] = pecas[:10]
             sess["estado"] = "lista"
             return fmt_lista(pecas[:10]), sess
-
     return None, sess
 
 def _aplicacao(peca):
     if not peca: return "Peça não encontrada na sessão."
     sku = peca.get("sku","")
     c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    cur.execute("SELECT modelo,ano_inicio,ano_fim,motor_versao FROM fitment WHERE sku_autoflex=? ORDER BY modelo,ano_inicio LIMIT 20",(sku,))
+    cur.execute("SELECT modelo,ano_inicio,ano_fim,motor_versao FROM fitment "
+                "WHERE sku_autoflex=? ORDER BY modelo,ano_inicio LIMIT 20",(sku,))
     rows = cur.fetchall(); c.close()
     if not rows: return "Não encontrei aplicação detalhada.\n\nDigite 1, 2 ou 3 para continuar."
     txt = "Aplicação encontrada:\n\n"
@@ -459,32 +464,89 @@ def _historico(sess):
     return txt
 
 def _ajuda():
-    return ("Você pode buscar assim:\n\n"
+    gemini_status = f"✅ ativo ({MODELO_VISAO})" if MODELO_VISAO else "❌ não configurado"
+    return (f"Você pode buscar assim:\n\n"
             "• cabo embreagem palio 2006\n• palio 2008\n• 4002\n"
-            "• oem 55204912\n• ref 55204912\n\n"
+            "• oem 55204912\n• ref 55204912\n"
+            "• 📷 envie uma foto da peça\n\n"
             "Depois de uma lista, responda com:\n"
             "• número da opção  • SKU  • OEM\n\n"
             "Após ver os detalhes, digite:\n"
-            "1 → aplicação completa\n2 → peças similares\n3 → nova busca")
+            "1 → aplicação completa\n2 → peças similares\n3 → nova busca\n\n"
+            f"Reconhecimento por imagem: {gemini_status}")
 
-# ============================================================
-# GEMINI
-# ============================================================
-def reconhecer_imagem(file_storage):
-    if not cliente_genai: return ""
+# ── Gemini: reconhecimento de imagem ─────────────────────────
+def reconhecer_imagem(file_storage) -> tuple[str, str]:
+    """
+    Retorna (descricao, erro).
+    - descricao: peça identificada (vazia se falhou)
+    - erro: mensagem amigável (vazia se sucesso)
+    Faz até 3 tentativas com backoff automático em caso de rate-limit (429).
+    """
+    if not cliente_genai or not MODELO_VISAO:
+        return "", ("Reconhecimento por imagem não configurado. "
+                    "Adicione GEMINI_API_KEY no arquivo .env e reinicie o servidor.")
+
+    # lê bytes uma única vez (FileStorage não permite re-leitura)
+    img_bytes = file_storage.read()
     try:
-        img  = PILImage.open(BytesIO(file_storage.read()))
-        resp = cliente_genai.models.generate_content(
-            model=MODELO_VISAO,
-            contents=["Identifique a peça automotiva nesta imagem. "
-                      "Responda APENAS com o nome da peça em português, clara e curta.", img])
-        return resp.text.strip()
+        img = PILImage.open(BytesIO(img_bytes))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
     except Exception as e:
-        print(f"⚠️ Gemini: {e}"); return ""
+        return "", f"Não foi possível abrir a imagem: {e}"
 
-# ============================================================
-# ROTAS
-# ============================================================
+    prompt = (
+        "Você é um especialista em peças automotivas. "
+        "Analise a imagem e identifique qual peça automotiva está sendo mostrada. "
+        "Responda APENAS com o nome técnico da peça em português, de forma curta e direta. "
+        "Exemplos de resposta: 'cabo de embreagem', 'amortecedor dianteiro', "
+        "'filtro de óleo', 'pastilha de freio', 'correia dentada'. "
+        "Se não conseguir identificar uma peça automotiva, responda: 'não identificado'."
+    )
+
+    MAX_TENTATIVAS = 3
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        try:
+            resp      = cliente_genai.models.generate_content(
+                model=MODELO_VISAO, contents=[prompt, img])
+            descricao = resp.text.strip()
+            print(f"   Gemini identificou: {descricao!r}")
+
+            if not descricao or "não identificado" in descricao.lower():
+                return "", ("Não consegui identificar a peça na imagem. "
+                            "Tente uma foto mais próxima e com boa iluminação, "
+                            "ou descreva a peça em texto.")
+            return descricao, ""
+
+        except Exception as e:
+            err_str = str(e)
+            print(f"⚠️  Gemini erro (tentativa {tentativa}/{MAX_TENTATIVAS}): {err_str[:300]}")
+
+            # ── 429 rate-limit: espera retryDelay e tenta de novo ──
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                m_delay = re.search(r"retryDelay[\W]+(\d+)", err_str)
+                delay   = int(m_delay.group(1)) + 2 if m_delay else 35
+                if tentativa < MAX_TENTATIVAS:
+                    print(f"   Rate-limit: aguardando {delay}s…")
+                    time.sleep(delay)
+                    continue
+                return "", (f"⏳ Limite de uso gratuito do Gemini atingido. "
+                            f"Aguarde ~{delay}s e tente novamente, "
+                            "ou descreva a peça em texto.")
+
+            # erros sem retry
+            if "404" in err_str or "NOT_FOUND" in err_str:
+                return "", (f"Modelo Gemini indisponível ({MODELO_VISAO}). "
+                            "Verifique sua chave de API e reinicie o servidor.")
+            if "403" in err_str or "API_KEY" in err_str.upper():
+                return "", "Chave GEMINI_API_KEY inválida ou sem permissão. Verifique o .env."
+
+            return "", f"Erro no reconhecimento: {err_str[:120]}"
+
+    return "", "Falha após múltiplas tentativas. Tente novamente mais tarde."
+
+# ── Rotas ─────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return send_from_directory("templates","index.html")
@@ -496,8 +558,6 @@ def static_files(filename):
 @app.route("/chat", methods=["POST"])
 def chat():
     key, sess = get_sess()
-
-    # log de debug (remove quando estiver estável)
     print(f"[{key}] estado={sess.get('estado')} opcoes={len(sess.get('opcoes',[]))}")
 
     if request.content_type and "multipart" in request.content_type:
@@ -511,22 +571,41 @@ def chat():
         mensagem = request.form.get("message","").strip()
         imagem   = request.files.get("image")
 
+    # ── processamento de imagem ───────────────────────────────
+    # "busca imagem" é o texto genérico enviado pelo frontend quando
+    # o usuário manda só a foto sem digitar nada — não serve como busca.
+    MSG_GENERICA = {"busca imagem", "busca por imagem", "identificar peça por imagem"}
+    texto_e_generico = mensagem.lower().strip() in MSG_GENERICA
+
     if imagem and imagem.filename:
-        desc = reconhecer_imagem(imagem)
-        if desc:
-            mensagem = f"busca imagem: {desc}"
-        elif not mensagem:
-            return jsonify({"response":
-                "📷 Imagem recebida, mas reconhecimento não configurado.\n"
-                "Adicione GEMINI_API_KEY no .env ou descreva a peça em texto."})
+        desc, erro = reconhecer_imagem(imagem)
+
+        if erro:
+            if texto_e_generico or not mensagem:
+                # sem texto útil do usuário → devolve só o erro
+                return jsonify({"response": f"📷 {erro}"})
+            else:
+                # tem texto real do usuário → loga e continua com ele
+                print(f"   Imagem falhou; usando texto do usuário: {mensagem!r}")
+
+        elif desc:
+            # Gemini identificou → combina com texto real do usuário (se houver)
+            if mensagem and not texto_e_generico:
+                mensagem = f"{desc} {mensagem}"
+            else:
+                mensagem = desc
+            print(f"   Busca por imagem: {mensagem!r}")
+
+    # descarta texto genérico se não veio imagem com sucesso
+    if texto_e_generico:
+        return jsonify({"response": "📷 Envie uma imagem junto com a mensagem para usar a busca por foto."}), 200
 
     if not mensagem:
         return jsonify({"error":"Nenhuma mensagem."}), 400
 
     resp_txt, sess = processar(mensagem, sess)
     save_sess(key, sess)
-
-    print(f"[{key}] → estado={sess.get('estado')} | resp: {resp_txt[:60]!r}")
+    print(f"[{key}] → estado={sess.get('estado')} | {resp_txt[:80]!r}")
     return jsonify({"response": resp_txt})
 
 @app.route("/reset", methods=["POST"])
@@ -539,18 +618,18 @@ def reset_route():
 def ping():
     key, sess = get_sess()
     return jsonify({
-        "status": "ok",
-        "pecas":  len(df),
-        "estado": sess.get("estado","livre"),
-        "client": key,
+        "status":  "ok",
+        "pecas":   len(df),
+        "estado":  sess.get("estado","livre"),
+        "gemini":  MODELO_VISAO or "não configurado",
+        "client":  key,
     })
 
-# ============================================================
-# MAIN
-# ============================================================
+# ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("="*60)
     print("🚀  AutoFlex Backend  →  http://localhost:5000")
+    print(f"🤖  Gemini visão:       {MODELO_VISAO or 'não configurado'}")
     print("📦  Sessões em memória, chave = IP do cliente.")
     print("="*60)
     app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
