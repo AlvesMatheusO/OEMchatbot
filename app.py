@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """
 Backend Flask – Assistente de Peças OEM
-Estado em memória, chave = IP do cliente.
-Integração RapidAPI Auto Parts Catalog (TecDoc) como fallback.
+Fonte: Auto Parts Catalog API (RapidAPI)
+Estrutura JSON mapeada via inspeção real da API.
 """
 
-import os, re, sys, sqlite3, time, json
-import urllib.parse
-import pandas as pd
-import requests
+import os, re, time
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
 
+import requests
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
-from rapidfuzz import fuzz
 
 # ── Gemini opcional ───────────────────────────────────────────
 GEMINI_OK     = False
 cliente_genai = None
 MODELO_VISAO  = None
-
 try:
     from google import genai
     from PIL import Image as PILImage
@@ -31,859 +27,768 @@ except ImportError:
     pass
 
 # ── Config ────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR       = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-EXCEL_PATH     = BASE_DIR / "data" / "CATALOGO_AUTOFLEX_BD_v1-3.xlsx"
-DB_PATH        = BASE_DIR / "autoflex_catalog.db"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY", "")
+RAPIDAPI_HOST  = "auto-parts-catalog.p.rapidapi.com"
+BASE_URL       = f"https://{RAPIDAPI_HOST}"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# RapidAPI
-RAPIDAPI_KEY      = os.getenv("RAPIDAPI_KEY", "")
-RAPIDAPI_HOST     = os.getenv("RAPIDAPI_HOST", "auto-parts-catalog.p.rapidapi.com")
-RAPIDAPI_BASE_URL = os.getenv("RAPIDAPI_BASE_URL", "https://auto-parts-catalog.p.rapidapi.com")
-RAPIDAPI_LANG_ID  = os.getenv("RAPIDAPI_LANG_ID", "31")   # 31 = português (BR)
+LANG_ID    = 4    # English
+COUNTRY_ID = 63   # Brasil
+TYPE_ID    = 1    # Automóveis
 
-MODELOS_CANDIDATOS = [
-    "gemini-2.0-flash", "gemini-1.5-flash",
-    "gemini-1.5-flash-latest", "gemini-1.5-pro",
-]
+MODELOS_GEMINI = ["gemini-2.0-flash","gemini-1.5-flash",
+                  "gemini-1.5-flash-latest","gemini-1.5-pro"]
 
+# ── Gemini ────────────────────────────────────────────────────
 def _init_gemini():
     global cliente_genai, MODELO_VISAO
-    if not GEMINI_OK or not GEMINI_API_KEY:
-        print("⚠️  Gemini não configurado.")
-        return
+    if not GEMINI_OK or not GEMINI_API_KEY: return
     try:
         cliente_genai = genai.Client(api_key=GEMINI_API_KEY)
-        disponiveis = {m.name.split("/")[-1] for m in cliente_genai.models.list()}
-        for cand in MODELOS_CANDIDATOS:
-            if cand in disponiveis:
-                MODELO_VISAO = cand
-                print(f"✅ Gemini pronto → modelo: {MODELO_VISAO}")
-                return
-        MODELO_VISAO = MODELOS_CANDIDATOS[0]
+        disp = {m.name.split("/")[-1] for m in cliente_genai.models.list()}
+        for c in MODELOS_GEMINI:
+            if c in disp:
+                MODELO_VISAO = c
+                print(f"✅ Gemini → {MODELO_VISAO}"); return
     except Exception as e:
-        print(f"⚠️  Falha Gemini: {e}")
+        print(f"⚠️ Gemini: {e}")
 
 _init_gemini()
 
 # ── Flask ─────────────────────────────────────────────────────
-app = Flask(__name__,
-            template_folder=str(BASE_DIR),
-            static_folder=str(BASE_DIR))
+app = Flask(__name__, template_folder=str(BASE_DIR), static_folder=str(BASE_DIR))
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 CORS(app, supports_credentials=True)
 
-# ── Sessões em memória (chave = IP) ───────────────────────────
+# ── Sessões em memória ────────────────────────────────────────
 _SESSIONS: dict = {}
 
 def _client_key():
     return request.headers.get("X-Forwarded-For", request.remote_addr) or "local"
 
 def get_sess():
-    key = _client_key()
-    if key not in _SESSIONS:
-        _SESSIONS[key] = estado_inicial()
-    return key, _SESSIONS[key]
+    k = _client_key()
+    if k not in _SESSIONS:
+        _SESSIONS[k] = _novo_estado()
+    return k, _SESSIONS[k]
 
-def save_sess(key, sess):
-    _SESSIONS[key] = sess
+def save_sess(k, s):
+    _SESSIONS[k] = s
 
-def estado_inicial():
+def _novo_estado():
     return {
         "estado": "livre",
         "opcoes": [],
         "peca_atual": None,
-        "ultimo_modelo": None,
-        "ultimo_ano": None,
-        "ultimos_termos": [],
+        "mfr_id": None,  "mfr_nome": None,
+        "mod_id": None,  "mod_nome": None,
+        "veh_id": None,  "veh_nome": None,
+        "cat_id": None,  "cat_nome": None,
         "historico": [],
+        "_pendente": None,
     }
 
-# ── Excel ─────────────────────────────────────────────────────
-print("🔄 Carregando catálogo…")
-try:
-    df = pd.read_excel(EXCEL_PATH, sheet_name="Catálogo Mestre")
-    print(f"✅ {len(df)} peças.")
-except Exception as e:
-    print(f"❌ {e}"); sys.exit(1)
+# ── Cache + HTTP ──────────────────────────────────────────────
+_CACHE: dict = {}
 
-for col, alias in [
-    ("SKU Autoflex","sku_str"), ("Código OEM","codigo_oem_str"),
-    ("Descrição","descricao_lower"), ("Montadora","montadora_str"),
-    ("Grupo","grupo_str"), ("Veículo","veiculo_str"),
-]:
-    df[alias] = df[col].fillna("").astype(str).str.strip()
-
-df["busca_texto"] = df.apply(
-    lambda r: " ".join(str(r.get(c,"")) for c in
-        ["SKU Autoflex","Código OEM","Descrição","Montadora","Grupo","Veículo"]).lower(),
-    axis=1)
-
-# ── SQLite ────────────────────────────────────────────────────
-def init_db():
-    c = sqlite3.connect(DB_PATH)
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS products (
-            sku_autoflex TEXT PRIMARY KEY, codigo_oem TEXT, descricao TEXT,
-            veiculo TEXT, montadora TEXT, linha TEXT, grupo TEXT,
-            ncm TEXT, ipi_percent TEXT, codigo_barras TEXT);
-        CREATE TABLE IF NOT EXISTS fitment (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sku_autoflex TEXT, montadora TEXT, modelo TEXT,
-            ano_inicio INTEGER, ano_fim INTEGER, motor_versao TEXT, confidence REAL,
-            FOREIGN KEY(sku_autoflex) REFERENCES products(sku_autoflex));
-        CREATE TABLE IF NOT EXISTS api_cache (
-            cache_key TEXT PRIMARY KEY, query TEXT, source TEXT,
-            response_json TEXT, created_at TEXT);
-        CREATE INDEX IF NOT EXISTS idx_prod_sku  ON products(sku_autoflex);
-        CREATE INDEX IF NOT EXISTS idx_prod_oem  ON products(codigo_oem);
-        CREATE INDEX IF NOT EXISTS idx_prod_desc ON products(descricao);
-        CREATE INDEX IF NOT EXISTS idx_fit_mod   ON fitment(modelo);
-        CREATE INDEX IF NOT EXISTS idx_cache_key ON api_cache(cache_key);
-    """)
-    c.commit(); c.close()
-
-def import_excel():
-    c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    cur.execute("SELECT COUNT(*) FROM products")
-    if cur.fetchone()[0] > 0:
-        c.close(); print("✅ SQLite já populado."); return
-    print("📥 Importando…")
-    df_p = pd.read_excel(EXCEL_PATH, sheet_name="Catálogo Mestre")
-    for _, row in df_p.iterrows():
-        cur.execute("INSERT OR REPLACE INTO products VALUES (?,?,?,?,?,?,?,?,?,?)",
-            tuple(str(row.get(k,"")).strip() for k in [
-                "SKU Autoflex","Código OEM","Descrição","Veículo",
-                "Montadora","Linha","Grupo","NCM","IPI %","Cód. Barras"]))
-    c.commit(); print(f"✅ {len(df_p)} produtos.")
+def _get(path: str, params: dict | None = None):
+    ck = path + str(sorted((params or {}).items()))
+    if ck in _CACHE: return _CACHE[ck]
+    if not RAPIDAPI_KEY:
+        print("❌ RAPIDAPI_KEY não configurada"); return None
+    hdrs = {"x-rapidapi-host": RAPIDAPI_HOST, "x-rapidapi-key": RAPIDAPI_KEY}
+    url  = f"{BASE_URL}/{path.lstrip('/')}"
     try:
-        df_f = pd.read_excel(EXCEL_PATH, sheet_name="Fitment Completo"); n = 0
-        for _, row in df_f.iterrows():
-            sku = str(row.get("SKU","")).strip()
-            cur.execute("SELECT 1 FROM products WHERE sku_autoflex=?", (sku,))
-            if not cur.fetchone(): continue
-            ai, af, cf = row.get("Ano Início"), row.get("Ano Fim"), row.get("Confidence", 0.6)
-            cur.execute(
-                "INSERT INTO fitment (sku_autoflex,montadora,modelo,ano_inicio,ano_fim,motor_versao,confidence)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (sku, str(row.get("Montadora","")).strip(), str(row.get("Modelo","")).strip(),
-                 int(ai) if pd.notna(ai) else None, int(af) if pd.notna(af) else None,
-                 str(row.get("Motor/Versão","")).strip(), float(cf) if pd.notna(cf) else 0.6))
-            n += 1
-        c.commit(); print(f"✅ {n} aplicações.")
+        r = requests.get(url, headers=hdrs, params=params or {}, timeout=15)
+        r.raise_for_status()
+        d = r.json(); _CACHE[ck] = d; return d
+    except requests.HTTPError as e:
+        print(f"❌ {e.response.status_code} /{path} {params}"); return None
     except Exception as e:
-        print(f"⚠️ Fitment: {e}")
-    c.close()
+        print(f"❌ {e}"); return None
 
-init_db()
-import_excel()
+# ── Parsers — cada endpoint tem estrutura própria ─────────────
+
+def api_fabricantes() -> list:
+    """{"countManufactures": N, "manufacturers": [{"manufacturerId":N, "manufacturerName":"..."}]}"""
+    d = _get(f"manufacturers/list/type-id/{TYPE_ID}")
+    if not d: return []
+    return d.get("manufacturers", [])
+
+def api_modelos(mfr_id) -> list:
+    """Estrutura variável — tenta todas as chaves conhecidas"""
+    d = _get(
+        f"models/list/type-id/{TYPE_ID}/manufacturer-id/{mfr_id}"
+        f"/lang-id/{LANG_ID}/country-filter-id/{COUNTRY_ID}"
+    )
+    if not d: return []
+    if isinstance(d, list): return d
+    for k in ("models","modelSeries","vehicleModels","data","result","items"):
+        if k in d and isinstance(d[k], list):
+            return d[k]
+    # fallback: primeiro valor que seja lista
+    for v in d.values():
+        if isinstance(v, list): return v
+    return []
+
+def api_motores(model_id) -> list:
+    """Lista de versões/veículos para um modelo"""
+    d = _get(
+        f"types/type-id/{TYPE_ID}/list-vehicles-types/{model_id}"
+        f"/lang-id/{LANG_ID}/country-filter-id/{COUNTRY_ID}"
+    )
+    if not d: return []
+    if isinstance(d, list): return d
+    for k in ("vehicles","types","vehicleTypes","data","result","items"):
+        if k in d and isinstance(d[k], list):
+            return d[k]
+    for v in d.values():
+        if isinstance(v, list): return v
+    return []
+
+def api_categorias() -> list:
+    """
+    Retorna dict aninhado:
+    {"Braking System": {"categoryId":N, "categoryName":"...", "children": {...}}}
+    → achata em lista plana de {"categoryId", "categoryName"}
+    """
+    d = _get(f"category/type-id/{TYPE_ID}/list-category-tree-structure/lang-id/{LANG_ID}")
+    if not d: return []
+    if isinstance(d, list): return d
+
+    result = []
+    def _achatar(obj):
+        if not isinstance(obj, dict): return
+        cid  = obj.get("categoryId")
+        nome = obj.get("categoryName","")
+        if cid:
+            result.append({"categoryId": cid, "categoryName": nome})
+        children = obj.get("children", {})
+        if isinstance(children, dict):
+            for child in children.values():
+                _achatar(child)
+        elif isinstance(children, list):
+            for child in children:
+                _achatar(child)
+
+    for top in d.values():
+        _achatar(top)
+    return result
+
+def api_artigos(veh_id, cat_id) -> list:
+    """{"countArticles": N, "articles": [...]}"""
+    d = _get(
+        f"articles/list/type-id/{TYPE_ID}/vehicle-id/{veh_id}"
+        f"/category-id/{cat_id}/lang-id/{LANG_ID}"
+    )
+    if not d: return []
+    if isinstance(d, list): return d
+    return d.get("articles", d.get("data", d.get("result", [])))
+
+def api_busca_numero(nr: str) -> list:
+    """{"countArticles": N, "articles": [...]}"""
+    d = _get("artlookup/search-articles-by-article-no", {
+        "langId": LANG_ID, "articleNo": nr, "articleType": "ArticleNumber"
+    })
+    if not d: return []
+    if isinstance(d, list): return d
+    return d.get("articles", [])
+
+def api_busca_oem(nr: str) -> list:
+    d = _get("artlookup/search-articles-by-article-no", {
+        "langId": LANG_ID, "articleNo": nr, "articleType": "OENumber"
+    })
+    if not d: return []
+    if isinstance(d, list): return d
+    return d.get("articles", [])
+
+def api_busca_auto(nr: str) -> list:
+    r = api_busca_numero(nr)
+    return r if r else api_busca_oem(nr)
+
+def api_compat(article_no: str, supplier_id) -> list:
+    d = _get(
+        f"articles/get-compatible-cars-by-article-number/type-id/{TYPE_ID}",
+        {"articleNo": article_no, "supplierId": supplier_id,
+         "langId": LANG_ID, "countryFilterId": COUNTRY_ID},
+    )
+    if not d: return []
+    if isinstance(d, list): return d
+    for k in ("vehicles","cars","data","result","items"):
+        if k in d and isinstance(d[k], list): return d[k]
+    return []
+
+# ── Cache aquecido ────────────────────────────────────────────
+_FABS_CACHE:  list = []   # todos os 698 fabricantes
+_CATS_CACHE:  list = []   # categorias achatadas
+_PRODS_CACHE: list = []   # 11092 nomes de produtos
+
+def _aquecer():
+    global _FABS_CACHE, _CATS_CACHE, _PRODS_CACHE
+    print("🔄 Carregando fabricantes…")
+    _FABS_CACHE = api_fabricantes()
+    print(f"   {len(_FABS_CACHE)} fabricantes.")
+    print("🔄 Carregando categorias…")
+    _CATS_CACHE = api_categorias()
+    print(f"   {len(_CATS_CACHE)} categorias.")
+    print("🔄 Carregando nomes de produtos…")
+    d = _get(f"category/list-products-names/lang-id/{LANG_ID}")
+    _PRODS_CACHE = d if isinstance(d, list) else []
+    print(f"   {len(_PRODS_CACHE)} produtos.")
+
+# ── Accessors de campos (suportam vários nomes de chave) ──────
+
+def _id_fab(it):
+    return it.get("manufacturerId") or it.get("mfrId") or it.get("id")
+
+def _nome_fab(it):
+    return _v(it.get("manufacturerName") or it.get("mfrName") or it.get("name",""))
+
+def _id_mod(it):
+    return it.get("modelId") or it.get("vehicleModelSeriesId") or it.get("id")
+
+def _nome_mod(it):
+    return _v(it.get("modelName") or it.get("vehicleModelSeriesName") or
+              it.get("name") or it.get("description",""))
+
+def _ano_mod(it):
+    """Retorna (ano_inicio, ano_fim) do modelo como strings 4-char."""
+    ini = str(it.get("modelYearFrom") or it.get("yearOfConstrFrom") or
+              it.get("constructionYearFrom") or "")[:4]
+    fim = str(it.get("modelYearTo")   or it.get("yearOfConstrTo")   or
+              it.get("constructionYearTo")   or "")[:4]
+    return ini, fim
+
+def _id_veh(it):
+    return it.get("vehicleId") or it.get("carId") or it.get("id")
+
+def _nome_veh(it):
+    return _v(it.get("fulldescription") or it.get("description") or
+              it.get("name") or it.get("vehicleName",""))
+
+def _id_cat(it):
+    return it.get("categoryId") or it.get("genericArticleId") or it.get("id")
+
+def _nome_cat(it):
+    return _v(it.get("categoryName") or it.get("genericArticleDescription") or
+              it.get("name") or it.get("description",""))
+
+def _id_art(it):
+    return it.get("articleId") or it.get("id")
+
+def _nome_art(it):
+    return _v(it.get("articleProductName") or it.get("articleName") or
+              it.get("description") or it.get("name",""))
+
+def _ref_art(it):
+    return _v(it.get("articleNo") or it.get("articleNumber") or
+              it.get("articleSearchNo",""))
+
+def _marca_art(it):
+    return _v(it.get("supplierName") or it.get("brandName",""))
 
 # ── Utilitários ───────────────────────────────────────────────
-def norm(s):
-    return re.sub(r"[^a-zA-Z0-9]","",str(s)).lower()
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
-def eh_codigo(t):
-    t = t.strip()
-    return bool(re.fullmatch(r"[a-zA-Z0-9\-.]{4,}", t)) and len(t.split())==1
-
-MODELOS_VEICULO = [
-    "palio","uno","strada","siena","punto","linea","idea","doblo","doblô",
-    "argo","cronos","mobi","fiorino","gol","fox","voyage","saveiro","virtus",
-    "onix","prisma","cobalt","spin","corsa","celta","agile","montana",
-    "toro","renegade","compass","hilux","corolla","hb20","civic","fit",
-]
-IGNORAR = {
-    "quero","preciso","procuro","tem","vc","voce","você","me","manda","ver",
-    "uma","um","o","a","os","as","de","do","da","dos","das","para","pra",
-    "com","peca","peça","produto","kit","completo","completa",
-    "dianteiro","dianteira","traseiro","traseira",
-}
-
-# Palavras que identificam TIPO de peça — usadas para evitar falsos positivos
-PALAVRAS_TIPO = {
-    "embreagem","freio","oleo","óleo","amortecedor","correia","filtro",
-    "vela","pastilha","rolamento","tensor","bomba","radiador","bateria",
-    "alternador","escapamento","suspensao","suspensão","mola","coxim",
-    "bucha","pivo","pivô","cubo","manga","semi","eixo","diferencial",
-    "marcha","transmissao","transmissão","cabo","sensor","bobina",
-}
-
-def extrair(texto):
-    t = texto.lower().strip()
-    modelo = next((m for m in MODELOS_VEICULO if re.search(rf"\b{re.escape(m)}\b",t)), None)
-    ano_m  = re.search(r"\b(19|20)\d{2}\b", t)
-    ano    = ano_m.group() if ano_m else None
-    termos = [p for p in re.findall(r"[a-zA-ZÀ-ÿ0-9]+",t)
-              if p not in IGNORAR and p != modelo and p != ano and len(p) > 2]
-    return termos, modelo, ano
-
-def score_relevancia(descricao_peca, termos_busca):
-    """
-    Relevância por match de palavras inteiras + penalidade por tipo conflitante.
-
-    1. Termo buscado = palavra inteira na desc → +25 pts
-    2. Termo buscado = substring na desc       → +10 pts
-    3. PALAVRA_TIPO na desc mas não buscada    → -30 pts
-    4. Nenhum termo encontrado                 → 0 (descarta)
-    """
-    if not termos_busca:
-        return 0
-
-    desc = descricao_peca.lower()
-    desc_palavras = set(re.findall(r"[a-zA-ZÀ-ÿ0-9]+", desc))
-
-    score = 0
-    termos_encontrados = 0
-    for t in termos_busca:
-        tl = t.lower()
-        if tl in desc_palavras:          # match exato de palavra inteira
-            score += 25
-            termos_encontrados += 1
-        elif tl in desc:                 # substring (ex: "cabo" em "cabos")
-            score += 10
-            termos_encontrados += 1
-
-    if termos_encontrados == 0:
-        return 0
-
-    # penalidade por tipo conflitante
-    tipos_buscados = {tl for tl in (t.lower() for t in termos_busca) if tl in PALAVRAS_TIPO}
-    tipos_na_desc  = {w for w in desc_palavras if w in PALAVRAS_TIPO}
-    tipos_conflito = tipos_na_desc - tipos_buscados
-    score -= len(tipos_conflito) * 30
-
-    return max(score, 0)
-
-# ── Buscas locais ─────────────────────────────────────────────
-def row2p(r):
-    return {"sku":str(r[0]).strip(),
-            "codigo_oem":str(r[1]).strip() if len(r)>1 else "",
-            "descricao":str(r[2]).strip()  if len(r)>2 else "",
-            "veiculo":str(r[3]).strip()    if len(r)>3 else "",
-            "montadora":str(r[4]).strip()  if len(r)>4 else "",
-            "grupo":str(r[5]).strip()      if len(r)>5 else "",
-            "ano_inicio":None,"ano_fim":None}
-
-def enrich(pecas):
-    if not pecas: return pecas
-    c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    for p in pecas:
-        cur.execute("SELECT ano_inicio,ano_fim FROM fitment "
-                    "WHERE sku_autoflex=? ORDER BY confidence DESC,ano_inicio LIMIT 1",(p["sku"],))
-        r = cur.fetchone()
-        if r: p["ano_inicio"],p["ano_fim"] = r[0],r[1]
-    c.close(); return pecas
-
-def filtrar_por_ano(pecas, ano):
-    if not ano: return pecas
-    ano_int = int(ano)
-    resultado = []
-    for p in pecas:
-        ai, af = p.get("ano_inicio"), p.get("ano_fim")
-        if ai is None:
-            p["ano_confirmado"] = False; resultado.append(p)
-        elif ai <= ano_int <= (af or 9999):
-            p["ano_confirmado"] = True; resultado.append(p)
-    resultado.sort(key=lambda x: 0 if x.get("ano_confirmado") else 1)
-    return resultado
-
-def buscar_codigo(codigo):
-    n = norm(codigo)
-    c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    cur.execute("""SELECT sku_autoflex,codigo_oem,descricao,veiculo,montadora,grupo FROM products
-        WHERE LOWER(REPLACE(REPLACE(sku_autoflex,'.','' ),'-',''))=?
-           OR LOWER(REPLACE(REPLACE(codigo_oem, '.','' ),'-',''))=?
-           OR codigo_oem LIKE ? OR sku_autoflex LIKE ? LIMIT 10""",
-        (n,n,f"%{codigo}%",f"%{codigo}%"))
-    rows = cur.fetchall(); c.close()
-    return enrich([row2p(r) for r in rows])
-
-def buscar_ref(texto):
-    m = re.search(r"(ref|rf|oem)\s*[:\-]?\s*([a-zA-Z0-9\-.]+)",texto.lower())
-    return buscar_codigo(m.group(2)) if m else []
-
-def buscar_veiculo(modelo, ano=None, termos=None):
-    c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    q = ("SELECT p.sku_autoflex,p.codigo_oem,p.descricao,p.veiculo,p.montadora,p.grupo,"
-         "f.modelo,f.ano_inicio,f.ano_fim,f.motor_versao,f.confidence "
-         "FROM fitment f JOIN products p ON p.sku_autoflex=f.sku_autoflex "
-         "WHERE LOWER(f.modelo) LIKE ?")
-    params = [f"%{modelo.lower()}%"]
-    if ano:
-        q += " AND (f.ano_inicio<=? AND (f.ano_fim>=? OR f.ano_fim IS NULL))"
-        params += [int(ano),int(ano)]
-    q += " ORDER BY f.confidence DESC LIMIT 50"
-    cur.execute(q,params); rows = cur.fetchall(); c.close()
-    pecas = []
-    for r in rows:
-        p = {"sku":str(r[0]).strip(),"codigo_oem":str(r[1]).strip(),
-             "descricao":str(r[2]).strip(),"veiculo":str(r[3]).strip(),
-             "montadora":str(r[4]).strip(),"grupo":str(r[5]).strip(),
-             "modelo":str(r[6]).strip(),"ano_inicio":r[7],"ano_fim":r[8],
-             "motor_versao":str(r[9]).strip(),"confidence":r[10],"ano_confirmado":True}
-        if termos:
-            sc = score_relevancia(p["descricao"], termos)
-            # threshold dinâmico: mais termos → exige mais pontos
-            # 1 termo genérico ("cabo") → exige 25 (pelo menos 1 match exato)
-            # 2+ termos → exige 20 por termo
-            threshold = max(25, 20 * len(termos))
-            if sc < threshold: continue
-            p["_score"] = sc
-        pecas.append(p)
-    if termos:
-        pecas.sort(key=lambda x: x.get("_score",0), reverse=True)
-    return pecas[:10]
-
-def buscar_desc(termos, modelo=None, ano=None):
-    c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    # tenta frase completa primeiro
-    frase = " ".join(termos)
-    q = "SELECT sku_autoflex,codigo_oem,descricao,veiculo,montadora,grupo FROM products WHERE LOWER(descricao) LIKE ?"
-    params = [f"%{frase.lower()}%"]
-    if modelo:
-        q += " AND LOWER(veiculo) LIKE ?"; params.append(f"%{modelo.lower()}%")
-    q += " LIMIT 30"
-    cur.execute(q, params); rows = cur.fetchall()
-    if not rows:
-        q = "SELECT sku_autoflex,codigo_oem,descricao,veiculo,montadora,grupo FROM products WHERE 1=1"
-        params = []
-        for t in termos:
-            q += " AND LOWER(descricao) LIKE ?"; params.append(f"%{t.lower()}%")
-        if modelo:
-            q += " AND LOWER(veiculo) LIKE ?"; params.append(f"%{modelo.lower()}%")
-        q += " LIMIT 30"
-        cur.execute(q, params); rows = cur.fetchall()
-    c.close()
-    pecas = enrich([row2p(r) for r in rows])
-    scored = []
-    threshold = max(25, 20 * len(termos)) if termos else 25
-    for p in pecas:
-        sc = score_relevancia(p["descricao"], termos)
-        if sc >= threshold:
-            p["_score"] = sc; scored.append(p)
-    scored.sort(key=lambda x: x["_score"], reverse=True)
-    if ano:
-        scored = filtrar_por_ano(scored, ano)
-    return scored[:10]
-
-def buscar_fuzzy(consulta, limite=10):
-    termos, _, _ = extrair(consulta)
-    q = consulta.lower().strip(); res = []
-    for _, row in df.iterrows():
-        t = str(row["busca_texto"]).lower()
-        sc_base = max(fuzz.partial_ratio(q,t), fuzz.token_sort_ratio(q,t), fuzz.token_set_ratio(q,t))
-        if sc_base < 78: continue
-        desc = str(row.get("Descrição","")).strip()
-        sc_final = score_relevancia(desc, termos) if termos else sc_base
-        threshold_fuzzy = max(25, 20 * len(termos)) if termos else 50
-        if sc_final < threshold_fuzzy: continue
-        res.append({"score":sc_final,"sku":str(row.get("SKU Autoflex","")).strip(),
-            "codigo_oem":str(row.get("Código OEM","")).strip(),
-            "descricao":desc,"veiculo":str(row.get("Veículo","")).strip(),
-            "montadora":str(row.get("Montadora","")).strip(),
-            "grupo":str(row.get("Grupo","")).strip(),
-            "ano_inicio":None,"ano_fim":None})
-    res.sort(key=lambda x:x["score"],reverse=True)
-    return enrich(res[:limite])
-
-# ── RapidAPI Cache ────────────────────────────────────────────
-def cache_get(cache_key):
-    try:
-        c = sqlite3.connect(DB_PATH); cur = c.cursor()
-        cur.execute("SELECT response_json FROM api_cache WHERE cache_key=?", (cache_key,))
-        row = cur.fetchone(); c.close()
-        return json.loads(row[0]) if row else None
-    except Exception:
-        return None
-
-def cache_set(cache_key, query, source, data):
-    try:
-        c = sqlite3.connect(DB_PATH); cur = c.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO api_cache (cache_key,query,source,response_json,created_at)"
-            " VALUES (?,?,?,?,?)",
-            (cache_key, query, source, json.dumps(data, ensure_ascii=False), datetime.now().isoformat()))
-        c.commit(); c.close()
-    except Exception as e:
-        print(f"⚠️ cache_set erro: {e}")
-
-# ── RapidAPI HTTP ─────────────────────────────────────────────
-def rapidapi_ativo():
-    return bool(RAPIDAPI_KEY)
-
-def rapidapi_get(path):
-    if not rapidapi_ativo():
-        return None, "RAPIDAPI_KEY não configurada no .env"
-    url = f"{RAPIDAPI_BASE_URL}{path}"
-    headers = {
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key":  RAPIDAPI_KEY,
-    }
-    try:
-        r = requests.get(url, headers=headers, timeout=12)
-        if r.status_code == 429: return None, "Rate-limit RapidAPI. Aguarde e tente novamente."
-        if r.status_code in (401,403): return None, "Chave RapidAPI inválida."
-        if not r.ok: return None, f"Erro RapidAPI {r.status_code}: {r.text[:120]}"
-        return r.json(), ""
-    except requests.Timeout:
-        return None, "Timeout RapidAPI."
-    except Exception as e:
-        return None, f"Erro RapidAPI: {e}"
-
-# ── RapidAPI: busca por descrição/categoria ───────────────────
-def buscar_peca_api(texto):
-    """
-    Endpoint correto: /category/search-by-description/lang-id/{id}/search-query/{query}
-    Retorna grupos de produtos (categorias de peça) que correspondem à busca.
-    Os espaços e caracteres especiais são codificados em URL.
-    """
-    texto = str(texto).strip()
-    print(f"🌐 RapidAPI categoria → {texto!r}")
-
-    cache_key = f"catdesc:{norm(texto)}"
-    cached = cache_get(cache_key)
-    if cached:
-        print("📦 Cache API hit")
-        return _normalizar_categorias(cached)
-
-    query_enc = urllib.parse.quote(texto, safe="")
-    path = f"/category/search-by-description/lang-id/{RAPIDAPI_LANG_ID}/search-query/{query_enc}"
-    print(f"🔗 {path}")
-
-    data, erro = rapidapi_get(path)
-    if erro:
-        print(f"❌ RapidAPI categoria: {erro}")
-        return []
-    if not data:
-        return []
-
-    cache_set(cache_key, texto, "rapidapi_cat_search", data)
-    return _normalizar_categorias(data)
-
-def _normalizar_categorias(data):
-    """Transforma a resposta de categorias no formato interno de peças."""
-    items = []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        for key in ("data","items","assemblies","productGroups","results","assemblyGroups"):
-            if key in data and isinstance(data[key], list):
-                items = data[key]; break
-
-    pecas = []
-    for item in items:
-        name = str(item.get("assemblyGroupName",
-                   item.get("name",
-                   item.get("description","")))).strip()
-        gid  = str(item.get("assemblyGroupNodeId",
-                   item.get("productGroupId",
-                   item.get("id","")))).strip()
-        if not name: continue
-        pecas.append({
-            "sku": gid, "codigo_oem": "",
-            "descricao": name, "veiculo": "",
-            "montadora": "TecDoc API", "grupo": "CATEGORIA",
-            "ano_inicio": None, "ano_fim": None,
-            "origem": "rapidapi", "imagem": "",
-            "article_id": None, "supplier_id": None,
-        })
-    print(f"   Categorias encontradas: {len(pecas)}")
-    return pecas
-
-# ── RapidAPI: cross-reference por OEM ────────────────────────
-def buscar_cross_oem_api(oem):
-    """
-    Endpoint: /artlookup/search-for-cross-numbers/lang-id/{id}/article-type/OENumber/article-no/{no}
-    Retorna peças aftermarket equivalentes ao número OEM informado.
-    """
-    oem = str(oem).strip()
-    if not oem: return []
-    print(f"🌐 RapidAPI cross-OEM → {oem!r}")
-
-    cache_key = f"cross_oem:{norm(oem)}"
-    cached = cache_get(cache_key)
-    if cached:
-        return _normalizar_artigos(cached)
-
-    oem_enc = urllib.parse.quote(oem, safe="")
-    path = (f"/artlookup/search-for-cross-numbers"
-            f"/lang-id/{RAPIDAPI_LANG_ID}"
-            f"/article-type/OENumber"
-            f"/article-no/{oem_enc}")
-
-    data, erro = rapidapi_get(path)
-    if erro:
-        print(f"❌ RapidAPI cross-OEM: {erro}")
-        return []
-    if not data:
-        return []
-
-    cache_set(cache_key, oem, "rapidapi_cross_oem", data)
-    return _normalizar_artigos(data)
-
-# ── RapidAPI: busca artigo por número ────────────────────────
-def buscar_artigo_api(article_no):
-    """
-    Endpoint: /artlookup/search/lang-id/{id}/article-no/{no}
-    Busca um artigo específico pelo número (SKU/artigo).
-    """
-    article_no = str(article_no).strip()
-    if not article_no: return []
-
-    cache_key = f"artno:{norm(article_no)}"
-    cached = cache_get(cache_key)
-    if cached:
-        return _normalizar_artigos(cached)
-
-    no_enc = urllib.parse.quote(article_no, safe="")
-    path = f"/artlookup/search/lang-id/{RAPIDAPI_LANG_ID}/article-no/{no_enc}"
-    print(f"🌐 RapidAPI artigo → {article_no!r}")
-
-    data, erro = rapidapi_get(path)
-    if erro:
-        print(f"❌ RapidAPI artigo: {erro}")
-        return []
-    if not data:
-        return []
-
-    cache_set(cache_key, article_no, "rapidapi_art_search", data)
-    return _normalizar_artigos(data)
-
-def _normalizar_artigos(data):
-    """Transforma resposta de artigos no formato interno de peças."""
-    artigos = []
-    if isinstance(data, list):
-        artigos = data
-    elif isinstance(data, dict):
-        for key in ("articles","data","items","results"):
-            if key in data and isinstance(data[key], list):
-                artigos = data[key]; break
-
-    pecas = []
-    for item in artigos:
-        article_no   = str(item.get("articleNo","")).strip()
-        search_no    = str(item.get("articleSearchNo","")).strip()
-        product_name = str(item.get("articleProductName",
-                           item.get("name",""))).strip()
-        supplier     = str(item.get("supplierName",
-                           item.get("supplier",""))).strip()
-        image        = str(item.get("s3image",
-                           item.get("image",""))).strip()
-        descricao    = f"{product_name} - {supplier}" if supplier else product_name
-        pecas.append({
-            "sku": article_no or search_no,
-            "codigo_oem": search_no,
-            "descricao": descricao,
-            "veiculo": "",
-            "montadora": supplier,
-            "grupo": "ARTIGO API",
-            "ano_inicio": None, "ano_fim": None,
-            "origem": "rapidapi", "imagem": image,
-            "article_id": item.get("articleId"),
-            "supplier_id": item.get("supplierId"),
-        })
-    return pecas
-
-# ── Formatação ────────────────────────────────────────────────
-def v(val):
+def _v(val):
     s = str(val).strip() if val is not None else ""
     return "" if s.lower() in ("nan","none","null","") else s
 
-def fmt_resumo(p, n=None):
-    origem = p.get("origem","")
-    txt = (f"{n}️⃣ " if n else "") + f"{v(p.get('descricao'))}\n"
-    label = "Artigo" if origem in ("rapidapi","cache_api") else "SKU"
-    txt += f"{label}: {v(p.get('sku'))}"
-    if v(p.get("codigo_oem")): txt += f" | OEM: {v(p['codigo_oem'])}"
-    if p.get("ano_inicio"):    txt += f" | Ano: {p['ano_inicio']} - {p.get('ano_fim') or 'atual'}"
-    if p.get("ano_confirmado") is False: txt += " ⚠️ ano não confirmado"
-    if origem == "rapidapi":   txt += " 🌐"
+IGNORAR = {
+    "quero","preciso","procuro","tem","voce","você","me","manda","ver",
+    "uma","um","o","a","os","as","de","do","da","dos","das","para","pra",
+    "com","peca","peça","produto","carro","veiculo","veículo","qual",
+    "tenho","meu","minha","pelo","pela","preciso","buscar","busco",
+}
+
+def _termos(txt, ex=None):
+    return [p for p in re.findall(r"[a-zA-ZÀ-ÿ0-9]+", txt.lower())
+            if p not in IGNORAR and p not in (ex or []) and len(p) > 2]
+
+def _norm_match(texto, nome):
+    """Retorna True se texto aparece (normalizado) dentro de nome."""
+    tn, nn = _norm(texto), _norm(nome)
+    return tn in nn or any(_norm(p) in nn for p in texto.split() if len(p) > 2)
+
+def _melhor_match(texto, lista, *campos):
+    """Retorna o item de lista com maior sobreposição a texto."""
+    tn = _norm(texto); hits = []
+    for it in lista:
+        for c in campos:
+            nn = _norm(str(it.get(c, "")))
+            if not nn: continue
+            if tn in nn:
+                hits.append((len(tn) / max(len(nn), 1), it)); break
+            elif any(_norm(p) in nn for p in texto.split() if len(p) > 2):
+                hits.append((0.3, it)); break
+    hits.sort(key=lambda x: x[0], reverse=True)
+    return hits[0][1] if hits else None
+
+def _extrair_ano(txt):
+    m = re.search(r"\b(19|20)\d{2}\b", txt)
+    return m.group() if m else None
+
+def _veh_no_ano(veh, ano):
+    try:
+        a = int(ano)
+        ini, fim = _ano_mod(veh)
+        if ini and int(ini) > a: return False
+        if fim and int(fim) < a: return False
+    except Exception: pass
+    return True
+
+# ── Formatação ────────────────────────────────────────────────
+def _fmt_lista(lista, tipo="itens"):
+    if not lista:
+        return f"Nenhum(a) {tipo} encontrado(a)."
+    txt = f"Encontrei {len(lista)} {tipo}:\n\n"
+    for i, it in enumerate(lista[:12], 1):
+        # tenta nome pelo tipo correto
+        n = (_nome_fab(it) or _nome_mod(it) or _nome_veh(it) or
+             _nome_cat(it) or _nome_art(it) or "?")
+        ini, fim = _ano_mod(it)
+        txt += f"  {i}. {n}"
+        if ini: txt += f" ({ini}" + (f"–{fim}" if fim else "") + ")"
+        txt += "\n"
+    txt += "\nDigite o número ou escreva o nome:"
     return txt
 
-def fmt_detalhe(p):
-    txt  = "✅ Peça encontrada\n\n"
-    txt += f"🔧 {v(p.get('descricao'))}\n\n"
-    if p.get("origem") in ("rapidapi","cache_api"):
-        txt += f"Artigo API: {v(p.get('sku'))}\n"
-    else:
-        txt += f"SKU Autoflex: {v(p.get('sku'))}\n"
-    if v(p.get("codigo_oem")):   txt += f"OEM / Referência: {v(p['codigo_oem'])}\n"
-    if v(p.get("montadora")):    txt += f"Montadora/Fornecedor: {v(p['montadora'])}\n"
-    if v(p.get("grupo")):        txt += f"Grupo: {v(p['grupo'])}\n"
-    if v(p.get("veiculo")):      txt += f"Aplicação: {v(p['veiculo'])}\n"
-    if v(p.get("modelo")):       txt += f"Modelo: {v(p['modelo'])}\n"
-    if v(p.get("motor_versao")): txt += f"Motor/versão: {v(p['motor_versao'])}\n"
-    if p.get("ano_inicio"):      txt += f"Ano: {p['ano_inicio']} até {p.get('ano_fim') or 'atual'}\n"
-    if v(p.get("imagem")):       txt += f"🖼️ {v(p.get('imagem'))}\n"
-    # equivalentes
-    equivalentes = p.get("equivalentes", [])
-    if equivalentes:
-        txt += "\n🔄 Equivalentes aftermarket:\n"
-        for eq in equivalentes[:5]:
-            txt += f"• {v(eq.get('descricao'))} (art. {v(eq.get('sku'))})\n"
-    txt += "\nVocê pode pedir:\n1️⃣ aplicação completa\n2️⃣ peças similares\n3️⃣ nova busca"
+def _fmt_detalhe(a):
+    nome  = _nome_art(a)
+    ref   = _ref_art(a)
+    marca = _marca_art(a)
+    txt   = "✅ Peça encontrada\n\n"
+    txt  += f"  🔧 {nome}\n\n"
+    if ref:   txt += f"  Referência: {ref}\n"
+    if marca: txt += f"  Marca:      {marca}\n"
+    crit = a.get("criteria") or a.get("attributes") or []
+    if isinstance(crit, list):
+        for c in crit[:6]:
+            cn = _v(c.get("criteriaDescription") or c.get("name",""))
+            cv = _v(c.get("rawValue") or c.get("value",""))
+            un = _v(c.get("criteriaUnitDescription") or c.get("unit",""))
+            if cn and cv: txt += f"  {cn}: {cv}{' '+un if un else ''}\n"
+    txt += "\n  1 → veículos compatíveis  2 → similares  3 → nova busca"
     return txt
 
-def fmt_lista(pecas):
-    txt = f"Encontrei {len(pecas)} opção(ões):\n\n"
-    for i,p in enumerate(pecas[:9],1):
-        txt += fmt_resumo(p,i) + "\n\n"
-    txt += "Responda com o número, SKU, OEM ou mande uma nova busca."
-    return txt
+def _fmt_vazio(q):
+    return (
+        f"Não encontrei resultados para: *{q}*\n\n"
+        "Tente:\n"
+        "  • fiat palio 2006 cabo embreagem\n"
+        "  • renault kwid amortecedor\n"
+        "  • oem 7700115294\n"
+        "  • /ajuda"
+    )
 
-def fmt_vazio(q):
-    return (f"Não encontrei uma peça com essa busca.\n\nBusca feita: {q}\n\n"
-            "Tente assim:\n• cabo embreagem palio 2006\n• 4002\n• oem 55204912\n• amortecedor uno")
-
-# ── Lógica conversacional ─────────────────────────────────────
-def processar(consulta, sess):
+# ── Processador principal ─────────────────────────────────────
+def processar(consulta: str, sess: dict):
     consulta = consulta.strip()
     if not consulta:
-        return "Digite uma peça, código, OEM ou veículo.", sess
+        return "Digite uma peça, código OEM ou veículo.", sess
 
     cmd    = consulta.lower().strip()
-    estado = sess.get("estado","livre")
+    estado = sess["estado"]
 
-    if cmd == "/ajuda":     return _ajuda(), sess
-    if cmd == "/historico": return _historico(sess), sess
-    if cmd in ("/limpar","sair"):
-        sess.update(estado_inicial()); return "Contexto limpo. Nova busca pronta.", sess
+    if cmd in ("/ajuda","ajuda","help"):
+        return _ajuda(), sess
+    if cmd in ("/historico","historico"):
+        return _historico(sess), sess
+    if cmd in ("/limpar","limpar","sair","reset","novo"):
+        return "🔍 Contexto limpo.", _novo_estado()
 
+    # ── detalhe ───────────────────────────────────────────────
     if estado == "detalhe":
-        peca = sess.get("peca_atual")
-        if cmd == "1": return _aplicacao(peca), sess
-        if cmd == "2": return _similares(peca, sess)
-        if cmd == "3":
-            sess.update(estado_inicial())
-            return "🔍 Nova busca. Digite o que deseja.", sess
-        sess.update(estado_inicial())
-        return processar(consulta, sess)
+        if cmd == "1": return _compat(sess)
+        if cmd == "2": return _similares(sess)
+        if cmd == "3": return "🔍 Nova busca.", _novo_estado()
+        return processar(consulta, _novo_estado())
 
+    # ── lista ─────────────────────────────────────────────────
     if estado == "lista":
-        opcoes = sess.get("opcoes",[])
-        resp, sess = _tentar_escolha(cmd, opcoes, sess)
-        if resp is not None: return resp, sess
-        sess.update(estado_inicial())
-        return processar(consulta, sess)
+        r, s = _escolha(cmd, sess)
+        if r is not None: return r, s
+        return processar(consulta, _novo_estado())
 
-    return _nova_busca(consulta, sess)
+    # ── guiado ────────────────────────────────────────────────
+    if estado.startswith("guiado_"):
+        return _guiado(consulta, cmd, sess)
 
-def _nova_busca(consulta, sess):
-    termos, modelo, ano = extrair(consulta)
-    ult_m = sess.get("ultimo_modelo")
-    ult_a = sess.get("ultimo_ano")
-    ult_t = sess.get("ultimos_termos",[])
-    if not modelo and ult_m and len(consulta.split()) <= 3: modelo = ult_m
-    if not ano and ult_a and modelo: ano = ult_a
-    if not termos and ult_t and modelo: termos = ult_t
-    if modelo: sess["ultimo_modelo"] = modelo
-    if ano:    sess["ultimo_ano"]    = ano
-    if termos: sess["ultimos_termos"] = termos
+    return _livre(consulta, sess)
 
-    # ── 1. Busca local ────────────────────────────────────────
-    pecas = []
-    if "ref" in consulta.lower() or "oem" in consulta.lower():
-        pecas = buscar_ref(consulta)
-    elif eh_codigo(consulta):
-        pecas = buscar_codigo(consulta)
-    elif modelo:
-        pecas = buscar_veiculo(modelo, ano, termos)
-        if not pecas and termos: pecas = buscar_desc(termos, modelo, ano)
-    elif termos:
-        pecas = buscar_desc(termos, ano=ano)
+# ── Busca livre ───────────────────────────────────────────────
+NOMES_CARROS = {
+    "palio","gol","uno","corsa","civic","hilux","corolla","onix","hb20",
+    "fiat","volkswagen","vw","toyota","honda","chevrolet","ford","renault",
+    "hyundai","nissan","peugeot","citroen","mitsubishi","kia","jeep",
+    "strada","creta","kwid","sandero","logan","ka","fiesta","ecosport",
+    "ranger","duster","captur","stepway","oroch","tucson","yaris","etios",
+    "sw4","rav4","hr-v","hrv","wrv","wr-v","crv","cr-v","brv","br-v",
+    "tracker","spin","montana","agile","cobalt","celta","kadett","monza",
+    "siena","argo","cronos","mobi","fiorino","doblo","toro","pulse",
+    "polo","virtus","voyage","saveiro","fox","up","t-cross","taos","nivus",
+}
 
-    # ── 2. Fuzzy local ────────────────────────────────────────
-    if not pecas:
-        print(f"🧠 Fuzzy → {consulta!r}")
-        pecas = buscar_fuzzy(consulta)
+def _livre(consulta: str, sess: dict):
+    txt = consulta.lower()
+    ano = _extrair_ano(txt)
 
-    # ── 3. RapidAPI: busca por código OEM (fallback direto) ───
-    if not pecas and rapidapi_ativo():
-        codigo_api = consulta.strip()
-        m = re.search(r"(ref|rf|oem)\s*[:\-]?\s*([a-zA-Z0-9\-.]+)", consulta.lower())
-        if m: codigo_api = m.group(2)
-        if eh_codigo(codigo_api) or "oem" in consulta.lower():
-            try:
-                pecas = buscar_cross_oem_api(codigo_api)
-                if not pecas:
-                    pecas = buscar_artigo_api(codigo_api)
-            except Exception as e:
-                print(f"❌ RapidAPI OEM: {e}")
+    # 1) Código/OEM: contém dígitos, sem palavras de carro
+    tok      = consulta.strip()
+    palavras = set(re.findall(r"[a-zA-Z]+", txt))
+    tem_num  = bool(re.search(r"\d{4,}", tok))
+    eh_cod   = tem_num and not (palavras & NOMES_CARROS)
 
-    # ── 4. RapidAPI: busca por categoria/descrição ────────────
-    if not pecas and rapidapi_ativo():
-        try:
-            # usa só termos relevantes para a query (remove modelo e ano)
-            query_api = " ".join(termos) if termos else consulta
-            pecas = buscar_peca_api(query_api)
-        except Exception as e:
-            print(f"❌ RapidAPI categoria: {e}")
+    if eh_cod or "oem" in txt or "ref" in txt:
+        nr = re.sub(r"(?i)(oem|ref)\s*:?\s*", "", tok).strip()
+        return _busca_numero(nr, sess)
 
-    # ── Sem resultado ─────────────────────────────────────────
-    if not pecas:
-        _salvar_hist(sess, consulta)
-        return fmt_vazio(consulta), sess
+    # 2) Tenta identificar fabricante no texto (busca em TODOS os 698)
+    fabs      = _FABS_CACHE or api_fabricantes()
+    fab_match = _melhor_match(txt, fabs, "manufacturerName", "mfrName")
 
-    # ── Resultado único → enriquece com equivalentes API ──────
-    if len(pecas) == 1:
-        peca = pecas[0]
-        peca["equivalentes"] = []
-        oem = peca.get("codigo_oem")
-        if oem and rapidapi_ativo():
-            try:
-                equiv = buscar_cross_oem_api(oem)
-                peca["equivalentes"] = [e for e in equiv if e.get("sku") != peca.get("sku")][:5]
-                print(f"🌐 Equivalentes: {len(peca['equivalentes'])}")
-            except Exception as e:
-                print(f"❌ Enriquecimento: {e}")
-        sess["peca_atual"] = peca
+    if fab_match:
+        mfr_id   = _id_fab(fab_match)
+        mfr_nome = _nome_fab(fab_match)
+        sess["mfr_id"]   = mfr_id
+        sess["mfr_nome"] = mfr_nome
+
+        modelos   = api_modelos(mfr_id)
+        mod_match = _melhor_match(txt, modelos, "modelName",
+                                  "vehicleModelSeriesName","name","description")
+
+        if mod_match:
+            mod_id   = _id_mod(mod_match)
+            mod_nome = _nome_mod(mod_match)
+            sess["mod_id"]   = mod_id
+            sess["mod_nome"] = mod_nome
+
+            motores = api_motores(mod_id)
+            if ano:
+                f2 = [v for v in motores if _veh_no_ano(v, ano)]
+                if f2: motores = f2
+
+            if len(motores) == 1:
+                return _sel_veiculo(motores[0], sess, consulta)
+            if motores:
+                sess["estado"] = "guiado_motor"
+                sess["opcoes"] = motores[:15]
+                _hist(sess, consulta)
+                return (f"Fabricante: **{mfr_nome}** | Modelo: **{mod_nome}**\n"
+                        f"Qual versão/motor?\n\n" +
+                        _fmt_lista(motores[:15], "versões")), sess
+        else:
+            if modelos:
+                sess["estado"] = "guiado_modelo"
+                sess["opcoes"] = modelos[:15]
+                _hist(sess, consulta)
+                return (f"Fabricante: **{mfr_nome}**\n"
+                        f"Qual modelo?\n\n" +
+                        _fmt_lista(modelos[:15], "modelos")), sess
+
+    # 3) Tem veículo na sessão → busca por categoria/termos
+    if sess.get("veh_id"):
+        return _cats_termos(consulta, sess), sess
+
+    # 4) Tenta produto nos 11k nomes → pede fabricante
+    ts = _termos(txt)
+    if ts and _PRODS_CACHE:
+        prod = _melhor_match(txt, _PRODS_CACHE, "productName")
+        if prod:
+            sess["_pendente"] = consulta
+            _hist(sess, consulta)
+            sess["estado"] = "guiado_fabricante"
+            sess["opcoes"] = fabs[:20]
+            return (f"Entendi: **{prod['productName']}**\n"
+                    f"De qual fabricante?\n\n" +
+                    _fmt_lista(fabs[:20], "fabricantes")), sess
+
+    # 5) Fluxo guiado completo
+    sess["_pendente"] = consulta
+    _hist(sess, consulta)
+    sess["estado"] = "guiado_fabricante"
+    sess["opcoes"] = fabs[:20]
+    return ("Qual o **fabricante** (montadora)?\n\n" +
+            _fmt_lista(fabs[:20], "fabricantes")), sess
+
+def _busca_numero(nr: str, sess: dict):
+    arts = api_busca_auto(nr)
+    if not arts: return _fmt_vazio(nr), sess
+    if len(arts) == 1:
+        sess["peca_atual"] = arts[0]
         sess["estado"]     = "detalhe"
-        _salvar_hist(sess, consulta)
-        return fmt_detalhe(peca), sess
-
-    # ── Lista ─────────────────────────────────────────────────
-    sess["opcoes"] = pecas[:10]
+        _hist(sess, nr)
+        return _fmt_detalhe(arts[0]), sess
     sess["estado"] = "lista"
-    _salvar_hist(sess, consulta)
-    return fmt_lista(pecas[:10]), sess
+    sess["opcoes"] = arts[:10]
+    _hist(sess, nr)
+    return _fmt_lista(arts[:10], "artigos"), sess
 
-def _tentar_escolha(cmd, opcoes, sess):
+def _cats_termos(consulta: str, sess: dict):
+    cats = _CATS_CACHE or api_categorias()
+    ts   = _termos(consulta)
+    cat  = None
+    for t in ts:
+        cat = _melhor_match(t, cats, "categoryName","genericArticleDescription","name")
+        if cat: break
+
+    if cat:
+        cat_id   = _id_cat(cat)
+        cat_nome = _nome_cat(cat)
+        sess["cat_id"]   = cat_id
+        sess["cat_nome"] = cat_nome
+        arts = api_artigos(sess["veh_id"], cat_id)
+        if arts:
+            if len(arts) == 1:
+                sess["peca_atual"] = arts[0]
+                sess["estado"]     = "detalhe"
+                return _fmt_detalhe(arts[0])
+            sess["estado"] = "lista"
+            sess["opcoes"] = arts[:10]
+            return f"Categoria: **{cat_nome}**\n\n" + _fmt_lista(arts[:10], "peças")
+
+    sess["estado"] = "guiado_categoria"
+    sess["opcoes"] = cats[:20]
+    return "Qual categoria de peça?\n\n" + _fmt_lista(cats[:20], "categorias")
+
+# ── Fluxo guiado ──────────────────────────────────────────────
+def _guiado(consulta: str, cmd: str, sess: dict):
+    opcoes = sess["opcoes"]
+    item   = None
+
     if cmd.isdigit():
         n = int(cmd)
         if 1 <= n <= len(opcoes):
-            peca = opcoes[n-1]
-            peca["equivalentes"] = []
-            oem = peca.get("codigo_oem")
-            if oem and rapidapi_ativo():
-                try:
-                    equiv = buscar_cross_oem_api(oem)
-                    peca["equivalentes"] = [e for e in equiv if e.get("sku") != peca.get("sku")][:5]
-                except Exception:
-                    pass
-            sess["peca_atual"] = peca
+            item = opcoes[n - 1]
+        else:
+            return f"❌ Digite de 1 a {len(opcoes)}.", sess
+    else:
+        # match por nome em todas as opções
+        for op in opcoes:
+            nome = (_nome_fab(op) or _nome_mod(op) or _nome_veh(op) or
+                    _nome_cat(op) or _nome_art(op))
+            if _norm_match(consulta, nome):
+                item = op; break
+
+    if item is None:
+        # não encontrou na lista → trata como nova busca
+        return processar(consulta, _novo_estado())
+
+    estado = sess["estado"]
+
+    if estado == "guiado_fabricante":
+        mfr_id   = _id_fab(item)
+        mfr_nome = _nome_fab(item)
+        sess["mfr_id"]   = mfr_id
+        sess["mfr_nome"] = mfr_nome
+        modelos = api_modelos(mfr_id)
+        if not modelos:
+            return f"Não encontrei modelos para {mfr_nome}.", _novo_estado()
+        sess["estado"] = "guiado_modelo"
+        sess["opcoes"] = modelos[:15]
+        return (f"Fabricante: **{mfr_nome}**\n"
+                f"Qual modelo?\n\n" +
+                _fmt_lista(modelos[:15], "modelos")), sess
+
+    if estado == "guiado_modelo":
+        mod_id   = _id_mod(item)
+        mod_nome = _nome_mod(item)
+        sess["mod_id"]   = mod_id
+        sess["mod_nome"] = mod_nome
+        motores = api_motores(mod_id)
+        if not motores:
+            return f"Não encontrei versões para {mod_nome}.", _novo_estado()
+        if len(motores) == 1:
+            return _sel_veiculo(motores[0], sess)
+        sess["estado"] = "guiado_motor"
+        sess["opcoes"] = motores[:15]
+        return (f"Modelo: **{mod_nome}**\n"
+                f"Qual versão/motor?\n\n" +
+                _fmt_lista(motores[:15], "versões")), sess
+
+    if estado == "guiado_motor":
+        return _sel_veiculo(item, sess)
+
+    if estado == "guiado_categoria":
+        cat_id   = _id_cat(item)
+        cat_nome = _nome_cat(item)
+        sess["cat_id"]   = cat_id
+        sess["cat_nome"] = cat_nome
+        arts = api_artigos(sess["veh_id"], cat_id)
+        if not arts:
+            return f"Não encontrei peças em '{cat_nome}'.", sess
+        if len(arts) == 1:
+            sess["peca_atual"] = arts[0]
             sess["estado"]     = "detalhe"
-            return fmt_detalhe(peca), sess
-        return f"❌ Número inválido. Digite de 1 a {len(opcoes)}.", sess
-    if eh_codigo(cmd):
-        for p in opcoes:
-            if norm(cmd) in [norm(p.get("sku","")), norm(p.get("codigo_oem",""))]:
-                p["equivalentes"] = []
-                sess["peca_atual"] = p
-                sess["estado"]     = "detalhe"
-                return fmt_detalhe(p), sess
-        pecas = buscar_codigo(cmd)
-        if not pecas and rapidapi_ativo():
-            pecas = buscar_cross_oem_api(cmd) or buscar_artigo_api(cmd)
-        if pecas:
-            if len(pecas) == 1:
-                pecas[0]["equivalentes"] = []
-                sess["peca_atual"] = pecas[0]
-                sess["estado"]     = "detalhe"
-                return fmt_detalhe(pecas[0]), sess
-            sess["opcoes"] = pecas[:10]
-            sess["estado"] = "lista"
-            return fmt_lista(pecas[:10]), sess
+            return _fmt_detalhe(arts[0]), sess
+        sess["estado"] = "lista"
+        sess["opcoes"] = arts[:10]
+        return (f"Categoria: **{cat_nome}**\n\n" +
+                _fmt_lista(arts[:10], "peças")), sess
+
+    return "Estado inesperado. Digite /limpar.", _novo_estado()
+
+def _sel_veiculo(veh: dict, sess: dict, cp: str | None = None):
+    veh_id   = _id_veh(veh)
+    veh_nome = _nome_veh(veh)
+    sess["veh_id"]   = veh_id
+    sess["veh_nome"] = veh_nome
+    cp   = cp or sess.pop("_pendente", None)
+    cats = _CATS_CACHE or api_categorias()
+
+    if cp:
+        for t in _termos(cp):
+            cat = _melhor_match(t, cats, "categoryName",
+                                "genericArticleDescription","name")
+            if cat:
+                cat_id   = _id_cat(cat)
+                cat_nome = _nome_cat(cat)
+                arts     = api_artigos(veh_id, cat_id)
+                if arts:
+                    sess["cat_id"]   = cat_id
+                    sess["cat_nome"] = cat_nome
+                    if len(arts) == 1:
+                        sess["peca_atual"] = arts[0]
+                        sess["estado"]     = "detalhe"
+                        return _fmt_detalhe(arts[0]), sess
+                    sess["estado"] = "lista"
+                    sess["opcoes"] = arts[:10]
+                    return (f"Veículo: **{veh_nome}** | "
+                            f"Categoria: **{cat_nome}**\n\n" +
+                            _fmt_lista(arts[:10], "peças")), sess
+
+    sess["estado"] = "guiado_categoria"
+    sess["opcoes"] = cats[:20]
+    return (f"Veículo: **{veh_nome}**\n"
+            f"Qual categoria de peça?\n\n" +
+            _fmt_lista(cats[:20], "categorias")), sess
+
+# ── Pós-detalhe ───────────────────────────────────────────────
+def _compat(sess: dict):
+    peca = sess.get("peca_atual")
+    if not peca: return "Peça não encontrada.", sess
+    ref = _ref_art(peca)
+    sid = peca.get("supplierId","")
+    if not ref: return "Sem referência para buscar compatibilidade.", sess
+    veics = api_compat(ref, sid)
+    if not veics: return "Não encontrei veículos compatíveis.", sess
+    txt = f"Veículos compatíveis com **{ref}**:\n\n"
+    for i, v in enumerate(veics[:15], 1):
+        n        = _nome_veh(v)
+        ini, fim = _ano_mod(v)
+        txt += f"  {i}. {n}"
+        if ini: txt += f" ({ini}" + (f"–{fim}" if fim else "") + ")"
+        txt += "\n"
+    txt += "\n\n1 → compatíveis  2 → similares  3 → nova busca"
+    return txt, sess
+
+def _similares(sess: dict):
+    peca = sess.get("peca_atual")
+    if not peca: return "Peça não encontrada.", sess
+    ref = _ref_art(peca)
+    if ref:
+        arts = [a for a in api_busca_auto(ref) if _id_art(a) != _id_art(peca)]
+        if arts:
+            sess["estado"] = "lista"; sess["opcoes"] = arts[:10]
+            return "Similares:\n\n" + _fmt_lista(arts[:10], "artigos"), sess
+    if sess.get("veh_id") and sess.get("cat_id"):
+        arts = [a for a in api_artigos(sess["veh_id"], sess["cat_id"])
+                if _id_art(a) != _id_art(peca)]
+        if arts:
+            sess["estado"] = "lista"; sess["opcoes"] = arts[:10]
+            return ("Outras peças da categoria:\n\n" +
+                    _fmt_lista(arts[:10], "peças")), sess
+    return "Não encontrei similares.", sess
+
+def _escolha(cmd: str, sess: dict):
+    opcoes = sess["opcoes"]
+    if cmd.isdigit():
+        n = int(cmd)
+        if 1 <= n <= len(opcoes):
+            p = opcoes[n - 1]
+            sess["peca_atual"] = p; sess["estado"] = "detalhe"
+            return _fmt_detalhe(p), sess
+        return f"❌ Digite de 1 a {len(opcoes)}.", sess
+    # busca por código
+    if re.fullmatch(r"[a-zA-Z0-9\-\. ]{4,}", cmd):
+        arts = api_busca_auto(cmd)
+        if arts:
+            if len(arts) == 1:
+                sess["peca_atual"] = arts[0]; sess["estado"] = "detalhe"
+                return _fmt_detalhe(arts[0]), sess
+            sess["estado"] = "lista"; sess["opcoes"] = arts[:10]
+            return _fmt_lista(arts[:10], "artigos"), sess
     return None, sess
 
-def _aplicacao(peca):
-    if not peca: return "Peça não encontrada na sessão."
-    sku = peca.get("sku","")
-    c = sqlite3.connect(DB_PATH); cur = c.cursor()
-    cur.execute("SELECT modelo,ano_inicio,ano_fim,motor_versao FROM fitment "
-                "WHERE sku_autoflex=? ORDER BY modelo,ano_inicio LIMIT 20",(sku,))
-    rows = cur.fetchall(); c.close()
-    if not rows: return "Não encontrei aplicação detalhada.\n\nDigite 1, 2 ou 3 para continuar."
-    txt = "Aplicação encontrada:\n\n"
-    for mod,ai,af,motor in rows:
-        txt += f"• {mod}"
-        if ai:    txt += f" {ai}-{af or 'atual'}"
-        if motor: txt += f" | {motor}"
-        txt += "\n"
-    return txt + "\n\nDigite 1, 2 ou 3 para continuar."
-
-def _similares(peca, sess):
-    if not peca: return "Peça não encontrada.", sess
-    termos,_,_ = extrair(peca.get("descricao",""))
-    if not termos: return "Não consegui identificar similares.", sess
-    sim = [p for p in buscar_desc(termos[:2]) if p.get("sku") != peca.get("sku")]
-    if not sim: return "Não encontrei peças similares.", sess
-    sess["opcoes"] = sim[:10]
-    sess["estado"] = "lista"
-    return fmt_lista(sim[:10]), sess
-
-def _salvar_hist(sess, consulta):
-    h = sess.get("historico",[])
-    h.append({"hora":datetime.now().strftime("%H:%M:%S"),"consulta":consulta})
+def _hist(sess, q):
+    h = sess.get("historico", [])
+    h.append({"hora": datetime.now().strftime("%H:%M"), "q": q})
     sess["historico"] = h[-10:]
 
 def _historico(sess):
-    h = sess.get("historico",[])
+    h = sess.get("historico", [])
     if not h: return "Nenhum histórico ainda."
-    txt = "Últimas buscas:\n\n"
-    for item in h[-5:]: txt += f"- {item['hora']} | {item['consulta']}\n"
-    return txt
+    return "Últimas buscas:\n" + "".join(f"  {i['hora']} {i['q']}\n" for i in h[-5:])
 
 def _ajuda():
-    gemini_status  = f"✅ ({MODELO_VISAO})" if MODELO_VISAO else "❌ não configurado"
-    rapidapi_status = "✅ ativa" if rapidapi_ativo() else "❌ não configurada"
-    return ("Você pode buscar assim:\n\n"
-            "• cabo embreagem palio 2006\n• palio 2008\n• 4002\n"
-            "• oem 55204912\n• ref 55204912\n"
-            "• 📷 envie uma foto da peça\n\n"
-            "Depois de uma lista, responda com:\n"
-            "• número da opção  • SKU  • OEM\n\n"
-            "Após ver os detalhes, digite:\n"
-            "1 → aplicação completa\n2 → peças similares\n3 → nova busca\n\n"
-            f"Gemini visão: {gemini_status}\n"
-            f"RapidAPI catálogo: {rapidapi_status}")
+    g = f"✅ {MODELO_VISAO}" if MODELO_VISAO else "❌ não configurado"
+    return (
+        "Como buscar:\n\n"
+        "  Texto livre:\n"
+        "    fiat palio 2006 embreagem\n"
+        "    renault kwid amortecedor\n"
+        "    hyundai hb20 filtro óleo\n\n"
+        "  Por código/OEM:\n"
+        "    7700115294\n"
+        "    oem 0242236561\n\n"
+        "  Após ver uma peça:\n"
+        "    1 → veículos compatíveis\n"
+        "    2 → similares\n"
+        "    3 → nova busca\n\n"
+        "  Comandos: /limpar  /historico  /ajuda\n\n"
+        f"  📷 Reconhecimento por imagem: {g}"
+    )
 
-# ── Gemini: reconhecimento de imagem ─────────────────────────
+# ── Gemini imagem ─────────────────────────────────────────────
 def reconhecer_imagem(file_storage):
     if not cliente_genai or not MODELO_VISAO:
-        return "", "Reconhecimento por imagem não configurado. Adicione GEMINI_API_KEY no .env."
+        return "", "Reconhecimento por imagem não configurado."
     img_bytes = file_storage.read()
     try:
         img = PILImage.open(BytesIO(img_bytes))
         if img.mode not in ("RGB","L"): img = img.convert("RGB")
     except Exception as e:
         return "", f"Não foi possível abrir a imagem: {e}"
-
     prompt = (
-        "Você é um especialista em peças automotivas. "
-        "Analise a imagem e identifique qual peça automotiva está sendo mostrada. "
-        "Responda APENAS com o nome técnico da peça em português, curto e direto. "
-        "Exemplos: 'cabo de embreagem', 'amortecedor dianteiro', 'filtro de óleo'. "
-        "Se não for uma peça automotiva, responda: 'não identificado'."
+        "You are an automotive parts expert. Identify the part in the image. "
+        "Reply ONLY with the short English technical name. "
+        "Examples: 'clutch cable', 'front shock absorber', 'oil filter', "
+        "'brake pad', 'timing belt'. If you cannot identify: 'not identified'."
     )
-    MAX_TENTATIVAS = 3
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
+    for t in range(1, 4):
         try:
-            resp = cliente_genai.models.generate_content(model=MODELO_VISAO, contents=[prompt, img])
+            resp = cliente_genai.models.generate_content(
+                model=MODELO_VISAO, contents=[prompt, img])
             desc = resp.text.strip()
-            print(f"   Gemini identificou: {desc!r}")
-            if not desc or "não identificado" in desc.lower():
-                return "", "Não consegui identificar a peça. Tente foto mais próxima ou descreva em texto."
+            if not desc or "not identified" in desc.lower():
+                return "", "Não consegui identificar. Descreva a peça em texto."
             return desc, ""
         except Exception as e:
-            err = str(e)
-            print(f"⚠️  Gemini erro (tentativa {tentativa}/{MAX_TENTATIVAS}): {err[:200]}")
-            if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                m = re.search(r"retryDelay[\W]+(\d+)", err)
-                delay = int(m.group(1))+2 if m else 35
-                if tentativa < MAX_TENTATIVAS:
-                    time.sleep(delay); continue
-                return "", f"⏳ Limite Gemini atingido. Aguarde ~{delay}s ou descreva em texto."
-            if "404" in err or "NOT_FOUND" in err:
-                return "", f"Modelo Gemini indisponível. Reinicie o servidor."
-            if "403" in err or "API_KEY" in err.upper():
-                return "", "Chave GEMINI_API_KEY inválida."
-            return "", f"Erro: {err[:100]}"
+            es = str(e)
+            if "429" in es or "RESOURCE_EXHAUSTED" in es:
+                dm = re.search(r"retryDelay[\W]+(\d+)", es)
+                d  = int(dm.group(1)) + 2 if dm else 35
+                if t < 3: time.sleep(d); continue
+                return "", f"⏳ Limite Gemini. Aguarde ~{d}s."
+            return "", f"Erro: {es[:120]}"
     return "", "Falha após múltiplas tentativas."
 
 # ── Rotas ─────────────────────────────────────────────────────
-ARQUIVOS_PERMITIDOS = {"index.html","favicon.ico"}
+ARQUIVOS_PERMITIDOS = {"index.html", "favicon.ico"}
 
 @app.route("/")
 def index():
@@ -897,7 +802,6 @@ def static_files(filename):
 @app.route("/chat", methods=["POST"])
 def chat():
     key, sess = get_sess()
-    print(f"[{key}] estado={sess.get('estado')} opcoes={len(sess.get('opcoes',[]))}")
 
     if request.content_type and "multipart" in request.content_type:
         mensagem = request.form.get("message","").strip()
@@ -910,54 +814,55 @@ def chat():
         mensagem = request.form.get("message","").strip()
         imagem   = request.files.get("image")
 
-    MSG_GENERICA = {"busca imagem","busca por imagem","identificar peça por imagem"}
-    texto_e_generico = mensagem.lower().strip() in MSG_GENERICA
+    GENERICAS = {"busca imagem","busca por imagem","identificar peça por imagem"}
+    generico  = mensagem.lower().strip() in GENERICAS
 
     if imagem and imagem.filename:
         desc, erro = reconhecer_imagem(imagem)
         if erro:
-            if texto_e_generico or not mensagem:
+            if generico or not mensagem:
                 return jsonify({"response": f"📷 {erro}"})
-            print(f"   Imagem falhou; usando texto: {mensagem!r}")
         elif desc:
-            mensagem = f"{desc} {mensagem}" if mensagem and not texto_e_generico else desc
-            print(f"   Busca por imagem: {mensagem!r}")
+            mensagem = f"{desc} {mensagem}".strip() if mensagem and not generico else desc
 
-    if texto_e_generico:
-        return jsonify({"response":"📷 Envie uma imagem junto com a mensagem para buscar por foto."}), 200
+    if generico:
+        return jsonify({"response": "📷 Envie uma imagem junto com a mensagem."}), 200
     if not mensagem:
-        return jsonify({"error":"Nenhuma mensagem."}), 400
+        return jsonify({"error": "Nenhuma mensagem."}), 400
 
-    resp_txt, sess = processar(mensagem, sess)
+    resp, sess = processar(mensagem, sess)
     save_sess(key, sess)
-    print(f"[{key}] → estado={sess.get('estado')} | {resp_txt[:80]!r}")
-    return jsonify({"response": resp_txt})
+    print(f"[{key}] {sess['estado']} | {resp[:80]!r}")
+    return jsonify({"response": resp})
 
 @app.route("/reset", methods=["POST"])
 def reset_route():
-    key, _ = get_sess()
-    save_sess(key, estado_inicial())
+    k, _ = get_sess()
+    save_sess(k, _novo_estado())
     return jsonify({"ok": True})
 
 @app.route("/ping")
 def ping():
-    key, sess = get_sess()
+    k, sess = get_sess()
     return jsonify({
-        "status":   "ok",
-        "pecas":    len(df),
-        "estado":   sess.get("estado","livre"),
-        "gemini":   MODELO_VISAO or "não configurado",
-        "rapidapi": "ativa" if rapidapi_ativo() else "não configurada",
-        "client":   key,
+        "status":  "ok",
+        "estado":  sess["estado"],
+        "gemini":  MODELO_VISAO or "não configurado",
+        "api_key": "✅" if RAPIDAPI_KEY else "❌ faltando",
+        "fabs":    len(_FABS_CACHE),
+        "cats":    len(_CATS_CACHE),
+        "prods":   len(_PRODS_CACHE),
+        "client":  k,
     })
 
 # ── Main ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print("="*60)
-    print(f"🚀  AutoFlex Backend  →  http://localhost:{port}")
+    print("=" * 60)
+    print(f"🚀  AutoFlex  →  http://localhost:{port}")
+    print(f"🔑  RapidAPI: {'✅' if RAPIDAPI_KEY else '❌ FALTANDO'}")
     print(f"🤖  Gemini:   {MODELO_VISAO or 'não configurado'}")
-    print(f"🌐  RapidAPI: {'ativa' if rapidapi_ativo() else 'não configurada'}")
-    print("📦  Sessões em memória, chave = IP do cliente.")
-    print("="*60)
+    print("=" * 60)
+    _aquecer()
+    print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

@@ -1,768 +1,523 @@
 #!/usr/bin/env python3
 """
-Assistente de peças OEM - versão conversacional com menu de detalhes
-- Busca por veículo, descrição, código, OEM
-- Mostra ano do veículo nas opções
-- Menu após detalhes: 1 aplicação, 2 similares, 3 nova busca
+Agente CLI – Assistente de Peças OEM
+Fonte: Auto Parts Catalog API (RapidAPI)
+Estrutura JSON mapeada via inspeção real da API.
 """
-
-import os
-import re
-import sqlite3
-import pandas as pd
+import os, re, sys
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
+import requests
 from dotenv import load_dotenv
-from rapidfuzz import fuzz
 
-# ============================================================
-# CONFIGURAÇÕES
-# ============================================================
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR      = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-EXCEL_PATH = BASE_DIR / "data" / "CATALOGO_AUTOFLEX_BD_v1-3.xlsx"
-DB_PATH = BASE_DIR / "autoflex_catalog.db"
+RAPIDAPI_KEY  = os.getenv("RAPIDAPI_KEY","")
+RAPIDAPI_HOST = "auto-parts-catalog.p.rapidapi.com"
+BASE_URL      = f"https://{RAPIDAPI_HOST}"
+LANG_ID       = 4
+COUNTRY_ID    = 63
+TYPE_ID       = 1
 
-# ============================================================
-# CARREGAMENTO DO EXCEL (para fuzzy)
-# ============================================================
-try:
-    df = pd.read_excel(EXCEL_PATH, sheet_name="Catálogo Mestre")
-    print(f"✅ Base carregada: {EXCEL_PATH}")
-    print(f"📦 Total peças: {len(df)}")
-except Exception as e:
-    print(f"❌ Erro ao carregar Excel: {e}")
-    exit(1)
+# ── HTTP + cache ──────────────────────────────────────────────
+_CACHE: dict = {}
 
-df["sku_str"] = df["SKU Autoflex"].fillna("").astype(str).str.strip()
-df["codigo_oem_str"] = df["Código OEM"].fillna("").astype(str).str.strip()
-df["descricao_lower"] = df["Descrição"].fillna("").astype(str).str.lower()
-df["montadora_str"] = df["Montadora"].fillna("").astype(str).str.strip()
-df["grupo_str"] = df["Grupo"].fillna("").astype(str).str.strip()
-df["veiculo_str"] = df["Veículo"].fillna("").astype(str).str.strip()
-
-df["busca_texto"] = df.apply(
-    lambda row: " ".join([
-        str(row.get("SKU Autoflex", "")),
-        str(row.get("Código OEM", "")),
-        str(row.get("Descrição", "")),
-        str(row.get("Montadora", "")),
-        str(row.get("Grupo", "")),
-        str(row.get("Veículo", "")),
-    ]).lower(),
-    axis=1
-)
-
-# ============================================================
-# BANCO SQLITE
-# ============================================================
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            sku_autoflex TEXT PRIMARY KEY,
-            codigo_oem TEXT,
-            descricao TEXT,
-            veiculo TEXT,
-            montadora TEXT,
-            linha TEXT,
-            grupo TEXT,
-            ncm TEXT,
-            ipi_percent TEXT,
-            codigo_barras TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS fitment (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sku_autoflex TEXT,
-            montadora TEXT,
-            modelo TEXT,
-            ano_inicio INTEGER,
-            ano_fim INTEGER,
-            motor_versao TEXT,
-            confidence REAL,
-            FOREIGN KEY(sku_autoflex) REFERENCES products(sku_autoflex)
-        )
-    """)
-
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_prod_sku ON products(sku_autoflex)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_prod_oem ON products(codigo_oem)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_prod_desc ON products(descricao)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_fit_modelo ON fitment(modelo)")
-    conn.commit()
-    return conn
-
-def import_excel_to_sqlite():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM products")
-    if cursor.fetchone()[0] > 0:
-        print("✅ Banco SQLite já populado. Pulando importação.")
-        conn.close()
-        return
-
-    print("📥 Importando Catálogo Mestre...")
-    df_prod = pd.read_excel(EXCEL_PATH, sheet_name="Catálogo Mestre")
-    for _, row in df_prod.iterrows():
-        cursor.execute("""
-            INSERT OR REPLACE INTO products
-            (sku_autoflex, codigo_oem, descricao, veiculo, montadora, linha, grupo, ncm, ipi_percent, codigo_barras)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(row.get("SKU Autoflex", "")).strip(),
-            str(row.get("Código OEM", "")).strip(),
-            str(row.get("Descrição", "")).strip(),
-            str(row.get("Veículo", "")).strip(),
-            str(row.get("Montadora", "")).strip(),
-            str(row.get("Linha", "")).strip(),
-            str(row.get("Grupo", "")).strip(),
-            str(row.get("NCM", "")).strip(),
-            str(row.get("IPI %", "")).strip(),
-            str(row.get("Cód. Barras", "")).strip(),
-        ))
-    conn.commit()
-    print(f"✅ {len(df_prod)} produtos importados.")
-
-    print("📥 Importando Fitment...")
+def _get(path, params=None):
+    ck = path + str(sorted((params or {}).items()))
+    if ck in _CACHE: return _CACHE[ck]
+    if not RAPIDAPI_KEY: print("❌ RAPIDAPI_KEY não configurada"); return None
+    hdrs = {"x-rapidapi-host": RAPIDAPI_HOST, "x-rapidapi-key": RAPIDAPI_KEY}
     try:
-        df_fit = pd.read_excel(EXCEL_PATH, sheet_name="Fitment Completo")
-        total = 0
-        for _, row in df_fit.iterrows():
-            sku = str(row.get("SKU", "")).strip()
-            cursor.execute("SELECT 1 FROM products WHERE sku_autoflex = ?", (sku,))
-            if not cursor.fetchone():
-                continue
-            ano_inicio = row.get("Ano Início")
-            ano_fim = row.get("Ano Fim")
-            cursor.execute("""
-                INSERT INTO fitment
-                (sku_autoflex, montadora, modelo, ano_inicio, ano_fim, motor_versao, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                sku,
-                str(row.get("Montadora", "")).strip(),
-                str(row.get("Modelo", "")).strip(),
-                int(ano_inicio) if pd.notna(ano_inicio) else None,
-                int(ano_fim) if pd.notna(ano_fim) else None,
-                str(row.get("Motor/Versão", "")).strip(),
-                float(row.get("Confidence", 0.6)) if pd.notna(row.get("Confidence", None)) else 0.6
-            ))
-            total += 1
-        conn.commit()
-        print(f"✅ {total} aplicações importadas.")
+        r = requests.get(f"{BASE_URL}/{path.lstrip('/')}", headers=hdrs,
+                         params=params or {}, timeout=15)
+        r.raise_for_status()
+        d = r.json(); _CACHE[ck] = d; return d
+    except requests.HTTPError as e:
+        print(f"❌ {e.response.status_code} /{path}"); return None
     except Exception as e:
-        print(f"⚠️ Erro ao importar fitment: {e}")
-    conn.close()
+        print(f"❌ {e}"); return None
 
-# ============================================================
-# NORMALIZAÇÃO E UTILITÁRIOS
-# ============================================================
-def limpar_texto(texto):
-    return str(texto).lower().strip()
+# ── Endpoints ─────────────────────────────────────────────────
+def api_fabricantes():
+    d = _get(f"manufacturers/list/type-id/{TYPE_ID}")
+    return d.get("manufacturers", []) if d else []
 
-def normalizar_codigo(codigo):
-    return re.sub(r"[^a-zA-Z0-9]", "", str(codigo)).lower()
-
-def eh_codigo_puro(texto):
-    texto_limpo = texto.strip()
-    return bool(re.fullmatch(r"[a-zA-Z0-9\-.]{4,}", texto_limpo)) and len(texto_limpo.split()) == 1
-
-def detectar_intencao(texto):
-    texto = texto.lower().strip()
-    if eh_codigo_puro(texto):
-        return "codigo"
-    if "ref" in texto or "oem" in texto:
-        return "referencia"
-    modelos = obter_modelos_conhecidos()
-    if any(modelo in texto for modelo in modelos):
-        return "veiculo"
-    return "descricao"
-
-def obter_modelos_conhecidos():
-    return [
-        "palio", "uno", "strada", "siena", "punto", "linea", "idea",
-        "doblo", "doblô", "argo", "cronos", "mobi", "fiorino",
-        "gol", "fox", "voyage", "saveiro", "virtus",
-        "onix", "prisma", "cobalt", "spin", "corsa", "celta",
-        "agile", "montana", "toro", "renegade", "compass",
-        "hilux", "corolla", "hb20", "civic", "fit"
-    ]
-
-def extrair_termos_modelo_ano(texto):
-    texto = texto.lower().strip()
-    ignorar = {
-       "quero","preciso","procuro","tem","vc","voce",
-    "você","me","manda","ver","uma","um","o","a",
-    "os","as","de","do","da","dos","das","para",
-    "pra","com","peca","peça","produto",
-
-    # termos genéricos automotivos
-    "kit",
-    "completo",
-    "completa",
-    "dianteiro",
-    "dianteira",
-    "traseiro",
-    "traseira",
-    }
-    modelos = obter_modelos_conhecidos()
-    modelo = None
-    for item in modelos:
-        if re.search(rf"\b{re.escape(item)}\b", texto):
-            modelo = item
-            break
-    ano = None
-    ano_match = re.search(r"\b(19|20)\d{2}\b", texto)
-    if ano_match:
-        ano = ano_match.group()
-    palavras = re.findall(r"[a-zA-ZÀ-ÿ0-9]+", texto)
-    termos = []
-    for palavra in palavras:
-        if palavra in ignorar:
-            continue
-        if modelo and palavra == modelo:
-            continue
-        if ano and palavra == ano:
-            continue
-        if len(palavra) <= 2:
-            continue
-        termos.append(palavra)
-    return termos, modelo, ano
-
-# ============================================================
-# BUSCAS
-# ============================================================
-def row_para_peca(row):
-    return {
-        "sku": str(row[0]).strip(),
-        "codigo_oem": str(row[1]).strip() if len(row) > 1 else "",
-        "descricao": str(row[2]).strip() if len(row) > 2 else "",
-        "veiculo": str(row[3]).strip() if len(row) > 3 else "",
-        "montadora": str(row[4]).strip() if len(row) > 4 else "",
-        "grupo": str(row[5]).strip() if len(row) > 5 else "",
-        "ano_inicio": None,
-        "ano_fim": None,
-    }
-
-def enriquecer_com_fitment(pecas):
-    if not pecas:
-        return pecas
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    for p in pecas:
-        sku = p["sku"]
-        cursor.execute("""
-            SELECT ano_inicio, ano_fim FROM fitment
-            WHERE sku_autoflex = ?
-            ORDER BY confidence DESC, ano_inicio
-            LIMIT 1
-        """, (sku,))
-        row = cursor.fetchone()
-        if row:
-            p["ano_inicio"] = row[0]
-            p["ano_fim"] = row[1]
-    conn.close()
-    return pecas
-
-def buscar_por_codigo(codigo):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    codigo_norm = normalizar_codigo(codigo)
-    cursor.execute("""
-        SELECT sku_autoflex, codigo_oem, descricao, veiculo, montadora, grupo
-        FROM products
-        WHERE LOWER(REPLACE(REPLACE(sku_autoflex, '.', ''), '-', '')) = ?
-           OR LOWER(REPLACE(REPLACE(codigo_oem, '.', ''), '-', '')) = ?
-           OR codigo_oem LIKE ? OR sku_autoflex LIKE ?
-        LIMIT 10
-    """, (codigo_norm, codigo_norm, f"%{codigo}%", f"%{codigo}%"))
-    rows = cursor.fetchall()
-    conn.close()
-    pecas = [row_para_peca(row) for row in rows]
-    return enriquecer_com_fitment(pecas)
-
-def buscar_por_referencia(texto):
-    match = re.search(r"(ref|rf|oem)\s*[:\-]?\s*([a-zA-Z0-9\-.]+)", texto.lower())
-    if match:
-        return buscar_por_codigo(match.group(2))
+def api_modelos(mfr_id):
+    d = _get(f"models/list/type-id/{TYPE_ID}/manufacturer-id/{mfr_id}"
+             f"/lang-id/{LANG_ID}/country-filter-id/{COUNTRY_ID}")
+    if not d: return []
+    if isinstance(d, list): return d
+    for k in ("models","modelSeries","vehicleModels","data","result","items"):
+        if k in d and isinstance(d[k], list): return d[k]
+    for v in d.values():
+        if isinstance(v, list): return v
     return []
 
-def buscar_por_veiculo(modelo=None, ano=None, termos=None):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    query = """
-        SELECT
-            p.sku_autoflex, p.codigo_oem, p.descricao, p.veiculo, p.montadora, p.grupo,
-            f.modelo, f.ano_inicio, f.ano_fim, f.motor_versao, f.confidence
-        FROM fitment f
-        JOIN products p ON p.sku_autoflex = f.sku_autoflex
-        WHERE 1=1
-    """
-    params = []
-    if modelo:
-        query += " AND LOWER(f.modelo) LIKE ?"
-        params.append(f"%{modelo.lower()}%")
-    if ano:
-        query += " AND (f.ano_inicio <= ? AND (f.ano_fim >= ? OR f.ano_fim IS NULL))"
-        params.extend([int(ano), int(ano)])
-    query += " ORDER BY f.confidence DESC LIMIT 30"
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-    conn.close()
-    pecas = []
-    for r in rows:
-        peca = {
-            "sku": str(r[0]).strip(),
-            "codigo_oem": str(r[1]).strip(),
-            "descricao": str(r[2]).strip(),
-            "veiculo": str(r[3]).strip(),
-            "montadora": str(r[4]).strip(),
-            "grupo": str(r[5]).strip(),
-            "modelo": str(r[6]).strip(),
-            "ano_inicio": r[7],
-            "ano_fim": r[8],
-            "motor_versao": str(r[9]).strip(),
-            "confidence": r[10],
-        }
-        if termos:
-            desc = peca["descricao"].lower()
+def api_motores(model_id):
+    d = _get(f"types/type-id/{TYPE_ID}/list-vehicles-types/{model_id}"
+             f"/lang-id/{LANG_ID}/country-filter-id/{COUNTRY_ID}")
+    if not d: return []
+    if isinstance(d, list): return d
+    for k in ("vehicles","types","vehicleTypes","data","result","items"):
+        if k in d and isinstance(d[k], list): return d[k]
+    for v in d.values():
+        if isinstance(v, list): return v
+    return []
 
-            termos_relevantes = [
-                t for t in termos
-                if len(t) > 3
-            ]
+def api_categorias():
+    d = _get(f"category/type-id/{TYPE_ID}/list-category-tree-structure/lang-id/{LANG_ID}")
+    if not d: return []
+    if isinstance(d, list): return d
+    result = []
+    def _flat(obj):
+        if not isinstance(obj, dict): return
+        cid = obj.get("categoryId"); nome = obj.get("categoryName","")
+        if cid: result.append({"categoryId": cid, "categoryName": nome})
+        ch = obj.get("children",{})
+        for c in (ch.values() if isinstance(ch, dict) else ch): _flat(c)
+    for top in d.values(): _flat(top)
+    return result
 
-            matches = sum(
-                1 for t in termos_relevantes
-                if t in desc
-            )
+def api_artigos(veh_id, cat_id):
+    d = _get(f"articles/list/type-id/{TYPE_ID}/vehicle-id/{veh_id}"
+             f"/category-id/{cat_id}/lang-id/{LANG_ID}")
+    if not d: return []
+    if isinstance(d, list): return d
+    return d.get("articles", d.get("data", d.get("result", [])))
 
-            # exige pelo menos 2 matches
-            if len(termos_relevantes) >= 2:
-                if matches < 2:
-                    continue
+def api_busca_nr(nr):
+    d = _get("artlookup/search-articles-by-article-no",
+             {"langId": LANG_ID, "articleNo": nr, "articleType": "ArticleNumber"})
+    if not d: return []
+    return d if isinstance(d, list) else d.get("articles", [])
 
-            # se só tiver 1 termo relevante
-            elif termos_relevantes:
-                if matches < 1:
-                    continue
-             
-        score_extra = 0
+def api_busca_oem(nr):
+    d = _get("artlookup/search-articles-by-article-no",
+             {"langId": LANG_ID, "articleNo": nr, "articleType": "OENumber"})
+    if not d: return []
+    return d if isinstance(d, list) else d.get("articles", [])
 
-        if "marcha" in termos and "marcha" in desc:
-            score_extra += 20
+def api_busca_auto(nr):
+    r = api_busca_nr(nr); return r if r else api_busca_oem(nr)
 
-        if "embreagem" in termos and "embreagem" in desc:
-            score_extra += 20
+def api_compat(article_no, supplier_id):
+    d = _get(f"articles/get-compatible-cars-by-article-number/type-id/{TYPE_ID}",
+             {"articleNo": article_no, "supplierId": supplier_id,
+              "langId": LANG_ID, "countryFilterId": COUNTRY_ID})
+    if not d: return []
+    if isinstance(d, list): return d
+    for k in ("vehicles","cars","data","result","items"):
+        if k in d and isinstance(d[k], list): return d[k]
+    return []
 
-        if "freio" in termos and "freio" in desc:
-            score_extra += 20
+# ── Cache global ──────────────────────────────────────────────
+_FABS: list = []
+_CATS: list = []
+_PRODS: list = []
 
-        peca["score"] = matches + score_extra
+def _carregar():
+    global _FABS, _CATS, _PRODS
+    print("  Carregando fabricantes...", end=" ", flush=True)
+    _FABS = api_fabricantes(); print(f"{len(_FABS)}")
+    print("  Carregando categorias...",  end=" ", flush=True)
+    _CATS = api_categorias();  print(f"{len(_CATS)}")
+    print("  Carregando produtos...",    end=" ", flush=True)
+    d = _get(f"category/list-products-names/lang-id/{LANG_ID}")
+    _PRODS = d if isinstance(d, list) else []; print(f"{len(_PRODS)}")
 
-        pecas.append(peca)
-        
-        pecas.sort(
-            key=lambda x: x.get("score", 0),
-            reverse=True
-        )
-        
-    return pecas[:10]
+# ── Accessors ─────────────────────────────────────────────────
+def _idf(it): return it.get("manufacturerId") or it.get("mfrId") or it.get("id")
+def _nf(it):  return _v(it.get("manufacturerName") or it.get("mfrName") or it.get("name",""))
+def _idm(it): return it.get("modelId") or it.get("vehicleModelSeriesId") or it.get("id")
+def _nm(it):  return _v(it.get("modelName") or it.get("vehicleModelSeriesName") or it.get("name") or it.get("description",""))
+def _idv(it): return it.get("vehicleId") or it.get("carId") or it.get("id")
+def _nv(it):  return _v(it.get("fulldescription") or it.get("description") or it.get("name") or it.get("vehicleName",""))
+def _idc(it): return it.get("categoryId") or it.get("genericArticleId") or it.get("id")
+def _nc(it):  return _v(it.get("categoryName") or it.get("genericArticleDescription") or it.get("name",""))
+def _ida(it): return it.get("articleId") or it.get("id")
+def _na(it):  return _v(it.get("articleProductName") or it.get("articleName") or it.get("description") or it.get("name",""))
+def _ra(it):  return _v(it.get("articleNo") or it.get("articleNumber") or it.get("articleSearchNo",""))
+def _ma(it):  return _v(it.get("supplierName") or it.get("brandName",""))
 
-def buscar_por_descricao(termos, modelo=None, ano=None):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    query = """
-        SELECT sku_autoflex, codigo_oem, descricao, veiculo, montadora, grupo
-        FROM products
-        WHERE 1=1
-    """
-    params = []
-    for t in termos:
-        query += " AND LOWER(descricao) LIKE ?"
-        params.append(f"%{t.lower()}%")
-    if modelo:
-        query += " AND LOWER(veiculo) LIKE ?"
-        params.append(f"%{modelo.lower()}%")
-    query += " LIMIT 20"
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-    conn.close()
-    pecas = [row_para_peca(row) for row in rows]
-    return enriquecer_com_fitment(pecas)
+def _anos(it):
+    ini = str(it.get("modelYearFrom") or it.get("yearOfConstrFrom") or it.get("constructionYearFrom") or "")[:4]
+    fim = str(it.get("modelYearTo")   or it.get("yearOfConstrTo")   or it.get("constructionYearTo")   or "")[:4]
+    return ini, fim
 
-def buscar_fuzzy(consulta, limite=10):
-    consulta = consulta.lower().strip()
-    resultados = []
-    for _, row in df.iterrows():
-        texto = str(row["busca_texto"]).lower()
-        score = max(
-            fuzz.partial_ratio(consulta, texto),
-            fuzz.token_sort_ratio(consulta, texto),
-            fuzz.token_set_ratio(consulta, texto)
-        )
-        if score >= 78:
-            resultados.append({
-                "score": score,
-                "sku": str(row.get("SKU Autoflex", "")).strip(),
-                "codigo_oem": str(row.get("Código OEM", "")).strip(),
-                "descricao": str(row.get("Descrição", "")).strip(),
-                "veiculo": str(row.get("Veículo", "")).strip(),
-                "montadora": str(row.get("Montadora", "")).strip(),
-                "grupo": str(row.get("Grupo", "")).strip(),
-                "ano_inicio": None,
-                "ano_fim": None,
-            })
-    resultados.sort(key=lambda x: x["score"], reverse=True)
-    pecas = resultados[:limite]
-    return enriquecer_com_fitment(pecas)
+def _nome_generico(it):
+    return _nf(it) or _nm(it) or _nv(it) or _nc(it) or _na(it) or "?"
 
-# ============================================================
-# FORMATAÇÃO
-# ============================================================
-def valor_limpo(valor):
-    if valor is None:
-        return ""
-    valor = str(valor).strip()
-    if valor.lower() in ["nan", "none", "null"]:
-        return ""
-    return valor
+# ── Utils ─────────────────────────────────────────────────────
+def _norm(s): return re.sub(r"[^a-z0-9]","",str(s).lower())
+def _v(val):
+    s = str(val).strip() if val is not None else ""
+    return "" if s.lower() in ("nan","none","null","") else s
 
-def formatar_resumo_peca(peca, numero=None):
-    sku = valor_limpo(peca.get("sku"))
-    descricao = valor_limpo(peca.get("descricao"))
-    oem = valor_limpo(peca.get("codigo_oem"))
-    ano_inicio = peca.get("ano_inicio")
-    ano_fim = peca.get("ano_fim")
-    prefixo = f"{numero}️⃣ " if numero else ""
-    texto = f"{prefixo}{descricao}\n"
-    texto += f"SKU: {sku}"
-    if oem:
-        texto += f" | OEM: {oem}"
-    if ano_inicio:
-        texto += f" | Ano: {ano_inicio} - {ano_fim or 'atual'}"
-    return texto
+IGNORAR = {
+    "quero","preciso","procuro","tem","voce","você","me","manda","ver",
+    "uma","um","o","a","os","as","de","do","da","dos","das","para","pra",
+    "com","peca","peça","produto","carro","veiculo","veículo","qual",
+    "tenho","meu","minha","pelo","pela","buscar","busco",
+}
 
-def formatar_detalhe_peca(peca):
-    sku = valor_limpo(peca.get("sku"))
-    oem = valor_limpo(peca.get("codigo_oem"))
-    descricao = valor_limpo(peca.get("descricao"))
-    veiculo = valor_limpo(peca.get("veiculo"))
-    montadora = valor_limpo(peca.get("montadora"))
-    grupo = valor_limpo(peca.get("grupo"))
-    modelo = valor_limpo(peca.get("modelo"))
-    motor = valor_limpo(peca.get("motor_versao"))
-    ano_inicio = peca.get("ano_inicio")
-    ano_fim = peca.get("ano_fim")
-    texto = "✅ Peça encontrada\n\n"
-    texto += f"🔧 {descricao}\n\n"
-    texto += f"SKU Autoflex: {sku}\n"
-    if oem:
-        texto += f"OEM / Referência: {oem}\n"
-    if montadora:
-        texto += f"Montadora: {montadora}\n"
-    if grupo:
-        texto += f"Grupo: {grupo}\n"
-    if veiculo:
-        texto += f"Aplicação: {veiculo}\n"
-    if modelo:
-        texto += f"Modelo: {modelo}\n"
-    if motor:
-        texto += f"Motor/versão: {motor}\n"
-    if ano_inicio:
-        texto += f"Ano: {ano_inicio} até {ano_fim or 'atual'}\n"
-    texto += "\nVocê pode pedir:\n1️⃣ aplicação completa\n2️⃣ peças similares\n3️⃣ nova busca"
-    return texto
+def _termos(txt, ex=None):
+    return [p for p in re.findall(r"[a-zA-ZÀ-ÿ0-9]+", txt.lower())
+            if p not in IGNORAR and p not in (ex or []) and len(p) > 2]
 
-def formatar_lista_pecas(pecas):
-    texto = f"Encontrei {len(pecas)} opção(ões):\n\n"
-    for i, peca in enumerate(pecas[:9], 1):
-        texto += formatar_resumo_peca(peca, i)
-        texto += "\n\n"
-    texto += "Responda com o número, SKU, OEM ou mande uma nova busca."
-    return texto
+def _match(texto, nome):
+    tn, nn = _norm(texto), _norm(nome)
+    return tn in nn or any(_norm(p) in nn for p in texto.split() if len(p) > 2)
 
-def formatar_sem_resultado(consulta):
-    return (f"Não encontrei uma peça com essa busca.\n\nBusca feita: {consulta}\n\n"
-            "Tente assim:\n• cabo embreagem palio 2006\n• 4002\n• oem 55204912\n• amortecedor uno")
+def _melhor(texto, lista, *campos):
+    tn = _norm(texto); hits = []
+    for it in lista:
+        for c in campos:
+            nn = _norm(str(it.get(c,"")))
+            if not nn: continue
+            if tn in nn: hits.append((len(tn)/max(len(nn),1), it)); break
+            elif any(_norm(p) in nn for p in texto.split() if len(p)>2): hits.append((0.3,it)); break
+    hits.sort(key=lambda x:x[0], reverse=True)
+    return hits[0][1] if hits else None
 
-# ============================================================
-# MEMÓRIA
-# ============================================================
-class MemoriaConversa:
-    def __init__(self, limite=20):
-        self.historico = deque(maxlen=limite)
-        self.contexto = {"ultimo_modelo": None, "ultimo_ano": None, "ultimos_termos": [],
-                         "ultima_peca": None, "ultima_intencao": None, "categoria": None,
-                         "montadora": None, "timestamp": None}
-    def salvar_busca(self, consulta, resposta, pecas=None):
-        self.historico.append({"hora": datetime.now().strftime("%H:%M:%S"),
-                               "consulta": consulta, "resposta": resposta[:200], "pecas": pecas or []})
-    def atualizar(self, modelo=None, ano=None, termos=None, peca=None, intencao=None, categoria=None, montadora=None):
-        if modelo: self.contexto["ultimo_modelo"] = modelo
-        if ano: self.contexto["ultimo_ano"] = ano
-        if termos: self.contexto["ultimos_termos"] = termos
-        if peca: self.contexto["ultima_peca"] = peca
-        if intencao: self.contexto["ultima_intencao"] = intencao
-        if categoria: self.contexto["categoria"] = categoria
-        if montadora: self.contexto["montadora"] = montadora
-        self.contexto["timestamp"] = datetime.now()
-    def obter(self): return self.contexto.copy()
-    def limpar(self):
-        self.contexto = {"ultimo_modelo": None, "ultimo_ano": None, "ultimos_termos": [],
-                         "ultima_peca": None, "ultima_intencao": None, "categoria": None,
-                         "montadora": None, "timestamp": None}
-    def historico_texto(self):
-        if not self.historico: return "Nenhum histórico ainda."
-        texto = "Últimas buscas:\n\n"
-        for item in list(self.historico)[-5:]:
-            texto += f"- {item['hora']} | {item['consulta']}\n"
-        return texto
+def _ano_txt(txt):
+    m = re.search(r"\b(19|20)\d{2}\b", txt); return m.group() if m else None
 
-# ============================================================
-# AGENTE PRINCIPAL (com menu de detalhes corrigido)
-# ============================================================
-class AgentePecas:
-    def __init__(self):
-        self.memoria = MemoriaConversa()
-        self.aguardando_escolha = False   # esperando número da lista
-        self.aguardando_acao_detalhe = False  # esperando 1,2,3 no menu de detalhes
-        self.opcoes_atuais = []
-        self.peca_atual = None
+def _veh_ano(veh, ano):
+    try:
+        a = int(ano); ini, fim = _anos(veh)
+        if ini and int(ini) > a: return False
+        if fim and int(fim) < a: return False
+    except: pass
+    return True
 
-    def processar(self, consulta):
+NOMES_CARROS = {
+    "palio","gol","uno","corsa","civic","hilux","corolla","onix","hb20",
+    "fiat","volkswagen","vw","toyota","honda","chevrolet","ford","renault",
+    "hyundai","nissan","peugeot","mitsubishi","kia","jeep","strada","creta",
+    "kwid","sandero","logan","ka","fiesta","ecosport","ranger","duster",
+    "captur","stepway","oroch","tucson","yaris","etios","hrv","wrv","brv",
+    "tracker","spin","montana","agile","cobalt","celta","siena","argo",
+    "cronos","mobi","fiorino","doblo","toro","pulse","polo","virtus",
+    "voyage","saveiro","fox","taos","nivus",
+}
+
+# ── Formatação ────────────────────────────────────────────────
+def fmt_lista(lista, tipo="itens"):
+    if not lista: return f"Nenhum(a) {tipo} encontrado(a)."
+    txt = f"Encontrei {len(lista)} {tipo}:\n\n"
+    for i, it in enumerate(lista[:12], 1):
+        n = _nome_generico(it)
+        ini, fim = _anos(it)
+        txt += f"  {i}. {n}"
+        if ini: txt += f" ({ini}" + (f"–{fim}" if fim else "") + ")"
+        txt += "\n"
+    txt += "\nDigite o número ou escreva o nome:"
+    return txt
+
+def fmt_detalhe(a):
+    nome  = _na(a); ref = _ra(a); marca = _ma(a)
+    txt   = "✅ Peça encontrada\n\n"
+    txt  += f"  🔧 {nome}\n\n"
+    if ref:   txt += f"  Referência: {ref}\n"
+    if marca: txt += f"  Marca:      {marca}\n"
+    crit = a.get("criteria") or a.get("attributes") or []
+    if isinstance(crit, list):
+        for c in crit[:6]:
+            cn = _v(c.get("criteriaDescription") or c.get("name",""))
+            cv = _v(c.get("rawValue") or c.get("value",""))
+            un = _v(c.get("criteriaUnitDescription") or c.get("unit",""))
+            if cn and cv: txt += f"  {cn}: {cv}{' '+un if un else ''}\n"
+    txt += "\n  1 → veículos compatíveis  2 → similares  3 → nova busca"
+    return txt
+
+def fmt_vazio(q):
+    return (f"Não encontrei: {q}\n\nExemplos:\n"
+            "  fiat palio 2006 embreagem\n"
+            "  renault kwid amortecedor\n"
+            "  hyundai hb20 filtro oleo\n"
+            "  oem 7700115294\n  /ajuda")
+
+# ── Estado ────────────────────────────────────────────────────
+def _novo():
+    return dict(estado="livre", opcoes=[], peca=None,
+                mfr_id=None, mfr_nome=None, mod_id=None, mod_nome=None,
+                veh_id=None, veh_nome=None, cat_id=None, cat_nome=None,
+                hist=deque(maxlen=10), pendente=None)
+
+# ── Agente ────────────────────────────────────────────────────
+class Agente:
+    def __init__(self): self.s = _novo()
+
+    def msg(self, consulta):
         consulta = consulta.strip()
-        if not consulta:
-            return "Digite uma peça, código, OEM ou veículo."
+        if not consulta: return "Digite uma peça, código ou veículo."
+        cmd    = consulta.lower().strip()
+        estado = self.s["estado"]
 
-        comando = consulta.lower()
-        if comando == "/ajuda": return self.ajuda()
-        if comando == "/historico": return self.memoria.historico_texto()
-        if comando == "/limpar":
-            self._resetar_estados()
-            self.memoria.limpar()
-            return "Contexto limpo."
-        if comando == "sair":
-            self._resetar_estados()
-            return "Busca cancelada."
+        if cmd in ("/ajuda","ajuda","help"):   return self._ajuda()
+        if cmd in ("/historico","historico"):  return self._hist_txt()
+        if cmd in ("/limpar","limpar","sair","reset","novo"):
+            self.s = _novo(); return "🔍 Contexto limpo."
 
-        # Estado: menu de detalhes (1,2,3)
-        if self.aguardando_acao_detalhe:
-            if comando == "1":
-                self.aguardando_acao_detalhe = False
-                return self.responder_aplicacao(self.peca_atual)
-            elif comando == "2":
-                self.aguardando_acao_detalhe = False
-                return self.buscar_similares(self.peca_atual)
-            elif comando == "3":
-                self._resetar_estados()
-                return "🔍 Nova busca. Digite o que deseja."
+        if estado == "detalhe":
+            if cmd == "1": return self._compat()
+            if cmd == "2": return self._similares()
+            if cmd == "3": self.s = _novo(); return "🔍 Nova busca."
+            self.s = _novo(); return self.msg(consulta)
+
+        if estado == "lista":
+            r = self._escolha(cmd)
+            if r is not None: return r
+            self.s = _novo(); return self.msg(consulta)
+
+        if estado.startswith("guiado_"):
+            return self._guiado(consulta, cmd)
+
+        return self._livre(consulta)
+
+    # ── Busca livre ───────────────────────────────────────────
+    def _livre(self, consulta):
+        txt = consulta.lower(); ano = _ano_txt(txt)
+
+        # código?
+        tok      = consulta.strip()
+        palavras = set(re.findall(r"[a-zA-Z]+", txt))
+        tem_num  = bool(re.search(r"\d{4,}", tok))
+        if (tem_num and not (palavras & NOMES_CARROS)) or "oem" in txt or "ref" in txt:
+            nr = re.sub(r"(?i)(oem|ref)\s*:?\s*","",tok).strip()
+            return self._busca_nr(nr)
+
+        fabs = _FABS or api_fabricantes()
+        fab  = _melhor(txt, fabs, "manufacturerName","mfrName")
+
+        if fab:
+            mid = _idf(fab); mn = _nf(fab)
+            self.s["mfr_id"] = mid; self.s["mfr_nome"] = mn
+            mods = api_modelos(mid)
+            mm   = _melhor(txt, mods, "modelName","vehicleModelSeriesName","name","description")
+            if mm:
+                modid = _idm(mm); modn = _nm(mm)
+                self.s["mod_id"] = modid; self.s["mod_nome"] = modn
+                motores = api_motores(modid)
+                if ano:
+                    f2 = [v for v in motores if _veh_ano(v, ano)]
+                    if f2: motores = f2
+                if len(motores) == 1: return self._sel(motores[0], consulta)
+                if motores:
+                    self.s["estado"] = "guiado_motor"; self.s["opcoes"] = motores[:15]
+                    self._add_hist(consulta)
+                    return f"Fabricante: {mn} | Modelo: {modn}\nQual versão?\n\n" + fmt_lista(motores[:15],"versões")
             else:
-                # Se digitar algo que não é 1,2,3, pode ser nova busca
-                self._resetar_estados()
-                # re-processa como nova consulta
-                return self.processar(consulta)
+                if mods:
+                    self.s["estado"] = "guiado_modelo"; self.s["opcoes"] = mods[:15]
+                    self._add_hist(consulta)
+                    return f"Fabricante: {mn}\nQual modelo?\n\n" + fmt_lista(mods[:15],"modelos")
 
-        # Estado: esperando escolha da lista
-        if self.aguardando_escolha:
-            resposta_escolha = self.tentar_processar_escolha(consulta)
-            if resposta_escolha:
-                return resposta_escolha
-            # Se não foi uma escolha válida, cancela e trata como nova busca
-            self._resetar_estados()
-            return self.processar(consulta)
+        if self.s.get("veh_id"): return self._cats_termos(consulta)
 
-        # --- Nova busca normal ---
-        intencao = detectar_intencao(consulta)
-        termos, modelo, ano = extrair_termos_modelo_ano(consulta)
-        contexto = self.memoria.obter()
-        # contexto automático
-        if not modelo and contexto["ultimo_modelo"] and len(consulta.split()) <= 3:
-            modelo = contexto["ultimo_modelo"]
-        if not ano and contexto["ultimo_ano"] and modelo:
-            ano = contexto["ultimo_ano"]
-        if not termos and contexto["ultimos_termos"] and modelo:
-            termos = contexto["ultimos_termos"]
-        self.memoria.atualizar(modelo=modelo, ano=ano, termos=termos, intencao=intencao)
+        # tenta produto
+        ts = _termos(txt)
+        if ts and _PRODS:
+            prod = _melhor(txt, _PRODS, "productName")
+            if prod:
+                self.s["pendente"] = consulta; self._add_hist(consulta)
+                self.s["estado"] = "guiado_fabricante"; self.s["opcoes"] = fabs[:20]
+                return f"Entendi: {prod['productName']}\nQual fabricante?\n\n" + fmt_lista(fabs[:20],"fabricantes")
 
-        pecas = []
-        if intencao == "codigo":
-            pecas = buscar_por_codigo(consulta)
-        elif intencao == "referencia":
-            pecas = buscar_por_referencia(consulta)
-        elif intencao == "veiculo":
-            pecas = buscar_por_veiculo(modelo=modelo, ano=ano, termos=termos)
-            if not pecas and termos:
-                pecas = buscar_por_descricao(termos, modelo=modelo, ano=ano)
+        self.s["pendente"] = consulta; self._add_hist(consulta)
+        self.s["estado"] = "guiado_fabricante"; self.s["opcoes"] = fabs[:20]
+        return "Qual o fabricante?\n\n" + fmt_lista(fabs[:20],"fabricantes")
+
+    def _busca_nr(self, nr):
+        arts = api_busca_auto(nr)
+        if not arts: return fmt_vazio(nr)
+        if len(arts) == 1:
+            self.s["peca"] = arts[0]; self.s["estado"] = "detalhe"
+            return fmt_detalhe(arts[0])
+        self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
+        return fmt_lista(arts[:10],"artigos")
+
+    def _cats_termos(self, consulta):
+        cats = _CATS or api_categorias(); ts = _termos(consulta); cat = None
+        for t in ts:
+            cat = _melhor(t, cats, "categoryName","genericArticleDescription","name")
+            if cat: break
+        if cat:
+            cid = _idc(cat); cn = _nc(cat)
+            arts = api_artigos(self.s["veh_id"], cid)
+            if arts:
+                self.s["cat_id"] = cid; self.s["cat_nome"] = cn
+                if len(arts) == 1:
+                    self.s["peca"] = arts[0]; self.s["estado"] = "detalhe"
+                    return fmt_detalhe(arts[0])
+                self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
+                return f"Categoria: {cn}\n\n" + fmt_lista(arts[:10],"peças")
+        self.s["estado"] = "guiado_categoria"; self.s["opcoes"] = cats[:20]
+        return "Qual categoria de peça?\n\n" + fmt_lista(cats[:20],"categorias")
+
+    # ── Guiado ────────────────────────────────────────────────
+    def _guiado(self, consulta, cmd):
+        opcoes = self.s["opcoes"]; item = None
+        if cmd.isdigit():
+            n = int(cmd)
+            if 1 <= n <= len(opcoes): item = opcoes[n-1]
+            else: return f"❌ Digite de 1 a {len(opcoes)}."
         else:
-            if termos:
-                pecas = buscar_por_descricao(termos, modelo=modelo, ano=ano)
+            for op in opcoes:
+                if _match(consulta, _nome_generico(op)): item = op; break
+        if item is None: self.s = _novo(); return self.msg(consulta)
 
-        if not pecas:
-            pecas = buscar_fuzzy(consulta)
+        estado = self.s["estado"]
 
-        if not pecas:
-            resposta = formatar_sem_resultado(consulta)
-            self.memoria.salvar_busca(consulta, resposta)
-            return resposta
+        if estado == "guiado_fabricante":
+            mid = _idf(item); mn = _nf(item)
+            self.s["mfr_id"] = mid; self.s["mfr_nome"] = mn
+            mods = api_modelos(mid)
+            if not mods: return f"Não encontrei modelos para {mn}."
+            self.s["estado"] = "guiado_modelo"; self.s["opcoes"] = mods[:15]
+            return f"Fabricante: {mn}\nQual modelo?\n\n" + fmt_lista(mods[:15],"modelos")
 
-        if len(pecas) == 1:
-            peca = pecas[0]
-            self.memoria.atualizar(peca=peca)
-            self.peca_atual = peca
-            self.aguardando_acao_detalhe = True
-            resposta = formatar_detalhe_peca(peca)
-            self.memoria.salvar_busca(consulta, resposta, [peca])
-            return resposta
+        if estado == "guiado_modelo":
+            modid = _idm(item); modn = _nm(item)
+            self.s["mod_id"] = modid; self.s["mod_nome"] = modn
+            motores = api_motores(modid)
+            if not motores: return f"Não encontrei versões para {modn}."
+            if len(motores) == 1: return self._sel(motores[0])
+            self.s["estado"] = "guiado_motor"; self.s["opcoes"] = motores[:15]
+            return f"Modelo: {modn}\nQual versão?\n\n" + fmt_lista(motores[:15],"versões")
 
-        self.opcoes_atuais = pecas[:10]
-        self.aguardando_escolha = True
-        resposta = formatar_lista_pecas(self.opcoes_atuais)
-        self.memoria.salvar_busca(consulta, resposta, self.opcoes_atuais)
-        return resposta
+        if estado == "guiado_motor":
+            return self._sel(item)
 
-    def tentar_processar_escolha(self, consulta):
-        texto = consulta.lower().strip()
-        # Escolha por número
-        if texto.isdigit():
-            numero = int(texto)
-            if 1 <= numero <= len(self.opcoes_atuais):
-                peca = self.opcoes_atuais[numero - 1]
-                self.memoria.atualizar(peca=peca)
-                self.peca_atual = peca
-                self.aguardando_escolha = False
-                self.aguardando_acao_detalhe = True
-                return formatar_detalhe_peca(peca)
-            else:
-                return f"❌ Número inválido. Digite de 1 a {len(self.opcoes_atuais)} ou mande uma nova busca."
-        # Escolha por SKU/OEM
-        if eh_codigo_puro(texto):
-            for peca in self.opcoes_atuais:
-                sku_norm = normalizar_codigo(peca.get("sku", ""))
-                oem_norm = normalizar_codigo(peca.get("codigo_oem", ""))
-                if normalizar_codigo(texto) in [sku_norm, oem_norm]:
-                    self.memoria.atualizar(peca=peca)
-                    self.peca_atual = peca
-                    self.aguardando_escolha = False
-                    self.aguardando_acao_detalhe = True
-                    return formatar_detalhe_peca(peca)
-            # Se não achou na lista, tenta busca global
-            pecas = buscar_por_codigo(texto)
-            if pecas:
-                if len(pecas) == 1:
-                    peca = pecas[0]
-                    self.memoria.atualizar(peca=peca)
-                    self.peca_atual = peca
-                    self.aguardando_escolha = False
-                    self.aguardando_acao_detalhe = True
-                    return formatar_detalhe_peca(peca)
-                else:
-                    self.opcoes_atuais = pecas[:10]
-                    self.aguardando_escolha = True
-                    return formatar_lista_pecas(self.opcoes_atuais)
-        # Se não foi escolha, retorna None (será tratado como nova busca)
+        if estado == "guiado_categoria":
+            cid = _idc(item); cn = _nc(item)
+            self.s["cat_id"] = cid; self.s["cat_nome"] = cn
+            arts = api_artigos(self.s["veh_id"], cid)
+            if not arts: return f"Não encontrei peças em '{cn}'."
+            if len(arts) == 1:
+                self.s["peca"] = arts[0]; self.s["estado"] = "detalhe"
+                return fmt_detalhe(arts[0])
+            self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
+            return f"Categoria: {cn}\n\n" + fmt_lista(arts[:10],"peças")
+
+        return "Estado desconhecido. Digite /limpar."
+
+    def _sel(self, veh, cp=None):
+        vid = _idv(veh); vn = _nv(veh)
+        self.s["veh_id"] = vid; self.s["veh_nome"] = vn
+        cp  = cp or self.s.pop("pendente", None)
+        cats = _CATS or api_categorias()
+        if cp:
+            for t in _termos(cp):
+                cat = _melhor(t, cats, "categoryName","genericArticleDescription","name")
+                if cat:
+                    cid = _idc(cat); cn = _nc(cat)
+                    arts = api_artigos(vid, cid)
+                    if arts:
+                        self.s["cat_id"] = cid; self.s["cat_nome"] = cn
+                        if len(arts) == 1:
+                            self.s["peca"] = arts[0]; self.s["estado"] = "detalhe"
+                            return fmt_detalhe(arts[0])
+                        self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
+                        return f"Veículo: {vn} | {cn}\n\n" + fmt_lista(arts[:10],"peças")
+        self.s["estado"] = "guiado_categoria"; self.s["opcoes"] = cats[:20]
+        return f"Veículo: {vn}\n\n" + fmt_lista(cats[:20],"categorias")
+
+    # ── Pós-detalhe ───────────────────────────────────────────
+    def _compat(self):
+        p = self.s.get("peca")
+        if not p: return "Peça não encontrada."
+        ref = _ra(p); sid = p.get("supplierId","")
+        if not ref: return "Sem referência para buscar compatibilidade."
+        veics = api_compat(ref, sid)
+        if not veics: return "Não encontrei veículos compatíveis."
+        txt = f"Veículos compatíveis com {ref}:\n\n"
+        for i, v in enumerate(veics[:15], 1):
+            n = _nv(v); ini, fim = _anos(v)
+            txt += f"  {i}. {n}"
+            if ini: txt += f" ({ini}" + (f"–{fim}" if fim else "") + ")"
+            txt += "\n"
+        txt += "\n\n1 → compatíveis  2 → similares  3 → nova busca"
+        return txt
+
+    def _similares(self):
+        p = self.s.get("peca")
+        if not p: return "Peça não encontrada."
+        ref = _ra(p)
+        if ref:
+            arts = [a for a in api_busca_auto(ref) if _ida(a) != _ida(p)]
+            if arts:
+                self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
+                return "Similares:\n\n" + fmt_lista(arts[:10],"artigos")
+        if self.s.get("veh_id") and self.s.get("cat_id"):
+            arts = [a for a in api_artigos(self.s["veh_id"], self.s["cat_id"])
+                    if _ida(a) != _ida(p)]
+            if arts:
+                self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
+                return "Outras peças da categoria:\n\n" + fmt_lista(arts[:10],"peças")
+        return "Não encontrei similares."
+
+    def _escolha(self, cmd):
+        opcoes = self.s["opcoes"]
+        if cmd.isdigit():
+            n = int(cmd)
+            if 1 <= n <= len(opcoes):
+                p = opcoes[n-1]; self.s["peca"] = p; self.s["estado"] = "detalhe"
+                return fmt_detalhe(p)
+            return f"❌ Digite de 1 a {len(opcoes)}."
+        if re.fullmatch(r"[a-zA-Z0-9\-\. ]{4,}", cmd):
+            arts = api_busca_auto(cmd)
+            if arts:
+                if len(arts) == 1:
+                    self.s["peca"] = arts[0]; self.s["estado"] = "detalhe"
+                    return fmt_detalhe(arts[0])
+                self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
+                return fmt_lista(arts[:10],"artigos")
         return None
 
-    def _resetar_estados(self):
-        self.aguardando_escolha = False
-        self.aguardando_acao_detalhe = False
-        self.opcoes_atuais = []
-        self.peca_atual = None
+    def _add_hist(self, q):
+        self.s["hist"].append({"h": datetime.now().strftime("%H:%M"), "q": q})
 
-    def responder_aplicacao(self, peca):
-        sku = peca.get("sku")
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT modelo, ano_inicio, ano_fim, motor_versao
-            FROM fitment
-            WHERE sku_autoflex = ?
-            ORDER BY modelo, ano_inicio
-            LIMIT 20
-        """, (sku,))
-        rows = cursor.fetchall()
-        conn.close()
-        if not rows:
-            return "Não encontrei aplicação detalhada para essa peça."
-        texto = "Aplicação encontrada:\n\n"
-        for row in rows:
-            modelo, ano_inicio, ano_fim, motor = row
-            texto += f"• {modelo}"
-            if ano_inicio:
-                texto += f" {ano_inicio}-{ano_fim or 'atual'}"
-            if motor:
-                texto += f" | {motor}"
-            texto += "\n"
-        # Volta para o menu de detalhes
-        self.aguardando_acao_detalhe = True
-        return texto + "\n\nDigite 1, 2 ou 3 para continuar."
+    def _hist_txt(self):
+        h = list(self.s["hist"])
+        if not h: return "Nenhum histórico."
+        return "Últimas buscas:\n" + "".join(f"  {i['h']} {i['q']}\n" for i in h[-5:])
 
-    def buscar_similares(self, peca):
-        descricao = peca.get("descricao", "")
-        termos, modelo, ano = extrair_termos_modelo_ano(descricao)
-        if not termos:
-            return "Não consegui identificar similares para essa peça."
-        similares = buscar_por_descricao(termos[:2])
-        similares = [p for p in similares if p.get("sku") != peca.get("sku")]
-        if not similares:
-            return "Não encontrei peças similares."
-        self.opcoes_atuais = similares[:10]
-        self.aguardando_escolha = True
-        self.aguardando_acao_detalhe = False
-        return formatar_lista_pecas(self.opcoes_atuais)
+    def _ajuda(self):
+        return (
+            "Como usar:\n\n"
+            "  Texto livre:\n"
+            "    fiat palio 2006 embreagem\n"
+            "    renault kwid amortecedor\n"
+            "    hyundai hb20 filtro oleo\n\n"
+            "  Por código/OEM:\n"
+            "    7700115294\n"
+            "    oem 0242236561\n\n"
+            "  Navegação: responda com número\n\n"
+            "  Após ver peça:\n"
+            "    1 → veículos compatíveis\n"
+            "    2 → similares\n"
+            "    3 → nova busca\n\n"
+            "  /limpar  /historico  /ajuda"
+        )
 
-    def ajuda(self):
-        return ("Você pode buscar assim:\n\n"
-                "• cabo embreagem palio 2006\n"
-                "• palio 2008\n"
-                "• 4002\n"
-                "• oem 55204912\n"
-                "• ref 55204912\n\n"
-                "Depois de uma lista, responda com:\n"
-                "• número da opção\n"
-                "• SKU\n"
-                "• OEM\n\n"
-                "Após ver os detalhes, digite:\n"
-                "1 para ver aplicação completa\n"
-                "2 para peças similares\n"
-                "3 para nova busca")
-
-# ============================================================
-# MAIN
-# ============================================================
+# ── Main ─────────────────────────────────────────────────────
 def main():
-    print("="*60)
-    print("🧠 AGENTE DE PEÇAS OEM - Conversacional (com anos)")
-    print("="*60)
-    print("Digite uma peça, veículo, SKU ou OEM.")
-    print("Exemplos:")
-    print("• cabo embreagem palio 2006")
-    print("• 4002")
-    print("• oem 55204912")
-    print("• /ajuda")
-    print("="*60)
-
-    init_db()
-    import_excel_to_sqlite()
-
-    agente = AgentePecas()
+    if not RAPIDAPI_KEY:
+        print("❌ RAPIDAPI_KEY não encontrada no .env"); sys.exit(1)
+    print("=" * 60)
+    print("🧠 AGENTE DE PEÇAS OEM  –  Auto Parts Catalog API")
+    print("=" * 60)
+    _carregar()
+    print("=" * 60)
+    ag = Agente()
     while True:
-        consulta = input("\nVocê: ").strip()
-        if not consulta:
-            continue
-        if consulta.lower() in ["fechar", "exit", "quit"]:
-            print("\nAté logo!")
-            break
-        resposta = agente.processar(consulta)
-        print(f"\n{resposta}")
+        try: q = input("\nVocê: ").strip()
+        except (EOFError, KeyboardInterrupt): print("\nAté logo!"); break
+        if not q: continue
+        if q.lower() in ("fechar","exit","quit"): print("Até logo!"); break
+        print(f"\n{ag.msg(q)}")
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+if __name__ == "__main__": main()
