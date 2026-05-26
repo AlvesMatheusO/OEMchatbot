@@ -2,7 +2,14 @@
 """
 Agente CLI – Assistente de Peças OEM
 Fonte: Auto Parts Catalog API (RapidAPI)
-Estrutura JSON mapeada via inspeção real da API.
+
+CORREÇÕES v2:
+  - BUG1: palavras de peças (motor, filtro, cabo...) não fazem mais match
+           com nomes de fabricantes (ex: "motor" → "ASIA MOTORS")
+  - BUG2: mapeamento direto modelo→fabricante para marcas BR comuns
+  - BUG3: _melhor_match exige match de palavra inteira (não substring parcial)
+  - BUG4: _nome_veh constrói nome composto quando fulldescription está ausente
+  - BUG5: versões sem nome utilizável são filtradas da lista
 """
 import os, re, sys
 from pathlib import Path
@@ -133,7 +140,21 @@ def _nf(it):  return _v(it.get("manufacturerName") or it.get("mfrName") or it.ge
 def _idm(it): return it.get("modelId") or it.get("vehicleModelSeriesId") or it.get("id")
 def _nm(it):  return _v(it.get("modelName") or it.get("vehicleModelSeriesName") or it.get("name") or it.get("description",""))
 def _idv(it): return it.get("vehicleId") or it.get("carId") or it.get("id")
-def _nv(it):  return _v(it.get("fulldescription") or it.get("description") or it.get("name") or it.get("vehicleName",""))
+
+def _nv(it):
+    """
+    FIX BUG2: constrói nome completo do veículo a partir dos campos disponíveis.
+    """
+    full = _v(it.get("fulldescription") or it.get("description") or
+               it.get("vehicleName") or it.get("name",""))
+    if full: return full
+    partes = []
+    for campo in ("mfrName","manufacturerName","modelName","vehicleModelSeriesName",
+                   "typeName","engineName","bodyStyleName","capacityDescription"):
+        v = _v(it.get(campo, ""))
+        if v and v not in partes: partes.append(v)
+    return " ".join(partes) if partes else ""
+
 def _idc(it): return it.get("categoryId") or it.get("genericArticleId") or it.get("id")
 def _nc(it):  return _v(it.get("categoryName") or it.get("genericArticleDescription") or it.get("name",""))
 def _ida(it): return it.get("articleId") or it.get("id")
@@ -155,11 +176,26 @@ def _v(val):
     s = str(val).strip() if val is not None else ""
     return "" if s.lower() in ("nan","none","null","") else s
 
+# FIX BUG1: expandido com nomes de peças que causavam matches errados
 IGNORAR = {
+    # artigos e preposições
     "quero","preciso","procuro","tem","voce","você","me","manda","ver",
     "uma","um","o","a","os","as","de","do","da","dos","das","para","pra",
-    "com","peca","peça","produto","carro","veiculo","veículo","qual",
-    "tenho","meu","minha","pelo","pela","buscar","busco",
+    "com","qual","tenho","meu","minha","pelo","pela","buscar","busco",
+    "novo","nova","original","genuino","genuína","oem","ref",
+    # palavras genéricas de veículo
+    "carro","veiculo","veículo","auto","automovel","automóvel",
+    "peca","peça","produto","item","componente","parte",
+    # FIX: nomes de peças que causam false match com fabricantes/modelos
+    "motor","motores","engine","filtro","cabo","rolamento","correia",
+    "sensor","valvula","válvula","bomba","vedacao","vedação","junta",
+    "bucha","mola","amortecedor","disco","pastilha","radiador","vela",
+    "bobina","alternador","bateria","embreagem","freio","escape",
+    "injetor","bico","cubo","manga","pivô","pivo","braco","braço",
+    "estabilizador","barra","mangueira","coxim","suporte","kit",
+    "conjunto","tampa","capa","eixo","transmissao","transmissão",
+    "diferencial","caixa","cambio","câmbio","suspensao","suspensão",
+    "direcao","direção","hidraulica","hidráulica",
 }
 
 def _termos(txt, ex=None):
@@ -171,14 +207,30 @@ def _match(texto, nome):
     return tn in nn or any(_norm(p) in nn for p in texto.split() if len(p) > 2)
 
 def _melhor(texto, lista, *campos):
-    tn = _norm(texto); hits = []
+    """
+    FIX BUG3: match de palavra inteira para evitar 'motor'⊂'asiamotors'.
+    """
+    tn = _norm(texto)
+    palavras = [_norm(p) for p in texto.split() if len(p) > 2]
+    hits = []
+
     for it in lista:
         for c in campos:
-            nn = _norm(str(it.get(c,"")))
+            nn = _norm(str(it.get(c, "")))
             if not nn: continue
-            if tn in nn: hits.append((len(tn)/max(len(nn),1), it)); break
-            elif any(_norm(p) in nn for p in texto.split() if len(p)>2): hits.append((0.3,it)); break
-    hits.sort(key=lambda x:x[0], reverse=True)
+            # Match exato ou quase completo
+            if tn == nn or (tn in nn and len(tn) >= len(nn) * 0.5):
+                hits.append((1.0, it)); break
+            # Match de palavra inteira (token isolado)
+            score = 0.0
+            for p in palavras:
+                if len(p) < 3: continue
+                if re.search(r'(?<![a-z0-9])' + re.escape(p) + r'(?![a-z0-9])', nn):
+                    score = max(score, len(p) / max(len(nn), 1))
+            if score > 0:
+                hits.append((score, it)); break
+
+    hits.sort(key=lambda x: x[0], reverse=True)
     return hits[0][1] if hits else None
 
 def _ano_txt(txt):
@@ -192,22 +244,72 @@ def _veh_ano(veh, ano):
     except: pass
     return True
 
-NOMES_CARROS = {
-    "palio","gol","uno","corsa","civic","hilux","corolla","onix","hb20",
+# ── Mapeamento direto modelo→fabricante ──────────────────────
+MODELO_PARA_FAB = {
+    # FIAT
+    "palio":"FIAT","siena":"FIAT","uno":"FIAT","argo":"FIAT","cronos":"FIAT",
+    "mobi":"FIAT","fiorino":"FIAT","doblo":"FIAT","doblô":"FIAT","toro":"FIAT",
+    "strada":"FIAT","pulse":"FIAT","fastback":"FIAT",
+    # VOLKSWAGEN
+    "gol":"VOLKSWAGEN","polo":"VOLKSWAGEN","virtus":"VOLKSWAGEN",
+    "voyage":"VOLKSWAGEN","saveiro":"VOLKSWAGEN","fox":"VOLKSWAGEN",
+    "taos":"VOLKSWAGEN","nivus":"VOLKSWAGEN","tcross":"VOLKSWAGEN",
+    "amarok":"VOLKSWAGEN","tiguan":"VOLKSWAGEN","jetta":"VOLKSWAGEN",
+    "crossfox":"VOLKSWAGEN","spacefox":"VOLKSWAGEN",
+    # CHEVROLET
+    "onix":"CHEVROLET","tracker":"CHEVROLET","spin":"CHEVROLET",
+    "montana":"CHEVROLET","agile":"CHEVROLET","cobalt":"CHEVROLET",
+    "celta":"CHEVROLET","corsa":"CHEVROLET","vectra":"CHEVROLET",
+    "astra":"CHEVROLET","zafira":"CHEVROLET","blazer":"CHEVROLET",
+    "s10":"CHEVROLET","trailblazer":"CHEVROLET","equinox":"CHEVROLET",
+    "cruze":"CHEVROLET","prisma":"CHEVROLET","kadett":"CHEVROLET",
+    "monza":"CHEVROLET","omega":"CHEVROLET","captiva":"CHEVROLET",
+    # HONDA
+    "civic":"HONDA","hrv":"HONDA","wrv":"HONDA","crv":"HONDA","brv":"HONDA",
+    "city":"HONDA","fit":"HONDA","accord":"HONDA",
+    # TOYOTA
+    "corolla":"TOYOTA","hilux":"TOYOTA","yaris":"TOYOTA","etios":"TOYOTA",
+    "sw4":"TOYOTA","rav4":"TOYOTA","camry":"TOYOTA","fortuner":"TOYOTA",
+    # HYUNDAI
+    "hb20":"HYUNDAI","creta":"HYUNDAI","tucson":"HYUNDAI","ix35":"HYUNDAI",
+    "i30":"HYUNDAI","santa":"HYUNDAI",
+    # RENAULT
+    "kwid":"RENAULT","sandero":"RENAULT","logan":"RENAULT","duster":"RENAULT",
+    "captur":"RENAULT","stepway":"RENAULT","oroch":"RENAULT",
+    "master":"RENAULT","kangoo":"RENAULT","megane":"RENAULT",
+    "fluence":"RENAULT","symbol":"RENAULT",
+    # FORD
+    "ka":"FORD","fiesta":"FORD","ecosport":"FORD","ranger":"FORD",
+    "fusion":"FORD","edge":"FORD","maverick":"FORD","transit":"FORD",
+    "courier":"FORD","escort":"FORD","focus":"FORD","territory":"FORD",
+    # NISSAN
+    "kicks":"NISSAN","versa":"NISSAN","march":"NISSAN","sentra":"NISSAN",
+    "frontier":"NISSAN","tiida":"NISSAN","livina":"NISSAN",
+    # KIA
+    "sportage":"KIA","sorento":"KIA","cerato":"KIA","soul":"KIA",
+    "carnival":"KIA","picanto":"KIA",
+    # PEUGEOT
+    "partner":"PEUGEOT","boxer":"PEUGEOT",
+    # MITSUBISHI
+    "outlander":"MITSUBISHI","asx":"MITSUBISHI","eclipse":"MITSUBISHI",
+    "pajero":"MITSUBISHI","l200":"MITSUBISHI",
+    # JEEP
+    "compass":"JEEP","renegade":"JEEP","wrangler":"JEEP","commander":"JEEP",
+    "cherokee":"JEEP","gladiator":"JEEP",
+}
+
+NOMES_CARROS = set(MODELO_PARA_FAB.keys()) | {
     "fiat","volkswagen","vw","toyota","honda","chevrolet","ford","renault",
-    "hyundai","nissan","peugeot","mitsubishi","kia","jeep","strada","creta",
-    "kwid","sandero","logan","ka","fiesta","ecosport","ranger","duster",
-    "captur","stepway","oroch","tucson","yaris","etios","hrv","wrv","brv",
-    "tracker","spin","montana","agile","cobalt","celta","siena","argo",
-    "cronos","mobi","fiorino","doblo","toro","pulse","polo","virtus",
-    "voyage","saveiro","fox","taos","nivus",
+    "hyundai","nissan","peugeot","citroen","mitsubishi","kia","jeep","gm",
 }
 
 # ── Formatação ────────────────────────────────────────────────
 def fmt_lista(lista, tipo="itens"):
     if not lista: return f"Nenhum(a) {tipo} encontrado(a)."
-    txt = f"Encontrei {len(lista)} {tipo}:\n\n"
-    for i, it in enumerate(lista[:12], 1):
+    lista_v = [it for it in lista if _nome_generico(it) != "?"]
+    if not lista_v: lista_v = lista
+    txt = f"Encontrei {len(lista_v)} {tipo}:\n\n"
+    for i, it in enumerate(lista_v[:15], 1):
         n = _nome_generico(it)
         ini, fim = _anos(it)
         txt += f"  {i}. {n}"
@@ -281,7 +383,7 @@ class Agente:
     def _livre(self, consulta):
         txt = consulta.lower(); ano = _ano_txt(txt)
 
-        # código?
+        # Código numérico?
         tok      = consulta.strip()
         palavras = set(re.findall(r"[a-zA-Z]+", txt))
         tem_num  = bool(re.search(r"\d{4,}", tok))
@@ -290,13 +392,39 @@ class Agente:
             return self._busca_nr(nr)
 
         fabs = _FABS or api_fabricantes()
-        fab  = _melhor(txt, fabs, "manufacturerName","mfrName")
+
+        # FIX BUG2: mapeamento direto modelo→fabricante
+        fab  = None
+        mod_hint = None
+        for token in re.findall(r"[a-zA-Z0-9\-]+", txt):
+            tk = token.lower().replace("-","")
+            if tk in MODELO_PARA_FAB:
+                nome_fab_hint = MODELO_PARA_FAB[tk]
+                mod_hint = tk
+                for f in fabs:
+                    if _norm(_nf(f)) == _norm(nome_fab_hint):
+                        fab = f; break
+                if fab: break
+
+        # Fallback: match genérico apenas em tokens não-peça
+        if not fab:
+            tokens_fab = [p for p in re.findall(r"[a-zA-ZÀ-ÿ]+", txt)
+                          if p not in IGNORAR and p not in MODELO_PARA_FAB and len(p) > 2]
+            for token in tokens_fab:
+                fab = _melhor(token, fabs, "manufacturerName","mfrName")
+                if fab: break
 
         if fab:
             mid = _idf(fab); mn = _nf(fab)
             self.s["mfr_id"] = mid; self.s["mfr_nome"] = mn
             mods = api_modelos(mid)
-            mm   = _melhor(txt, mods, "modelName","vehicleModelSeriesName","name","description")
+
+            mm = None
+            if mod_hint:
+                mm = _melhor(mod_hint, mods, "modelName","vehicleModelSeriesName","name","description")
+            if not mm:
+                mm = _melhor(txt, mods, "modelName","vehicleModelSeriesName","name","description")
+
             if mm:
                 modid = _idm(mm); modn = _nm(mm)
                 self.s["mod_id"] = modid; self.s["mod_nome"] = modn
@@ -304,11 +432,13 @@ class Agente:
                 if ano:
                     f2 = [v for v in motores if _veh_ano(v, ano)]
                     if f2: motores = f2
-                if len(motores) == 1: return self._sel(motores[0], consulta)
-                if motores:
-                    self.s["estado"] = "guiado_motor"; self.s["opcoes"] = motores[:15]
+                # FIX BUG2: filtra versões sem nome
+                motores_v = [v for v in motores if _nv(v)] or motores
+                if len(motores_v) == 1: return self._sel(motores_v[0], consulta)
+                if motores_v:
+                    self.s["estado"] = "guiado_motor"; self.s["opcoes"] = motores_v[:15]
                     self._add_hist(consulta)
-                    return f"Fabricante: {mn} | Modelo: {modn}\nQual versão?\n\n" + fmt_lista(motores[:15],"versões")
+                    return f"Fabricante: {mn} | Modelo: {modn}\nQual versão?\n\n" + fmt_lista(motores_v[:15],"versões")
             else:
                 if mods:
                     self.s["estado"] = "guiado_modelo"; self.s["opcoes"] = mods[:15]
@@ -317,7 +447,6 @@ class Agente:
 
         if self.s.get("veh_id"): return self._cats_termos(consulta)
 
-        # tenta produto
         ts = _termos(txt)
         if ts and _PRODS:
             prod = _melhor(txt, _PRODS, "productName")
@@ -366,7 +495,8 @@ class Agente:
             else: return f"❌ Digite de 1 a {len(opcoes)}."
         else:
             for op in opcoes:
-                if _match(consulta, _nome_generico(op)): item = op; break
+                nome = _nome_generico(op)
+                if nome and _match(consulta, nome): item = op; break
         if item is None: self.s = _novo(); return self.msg(consulta)
 
         estado = self.s["estado"]
@@ -384,9 +514,11 @@ class Agente:
             self.s["mod_id"] = modid; self.s["mod_nome"] = modn
             motores = api_motores(modid)
             if not motores: return f"Não encontrei versões para {modn}."
-            if len(motores) == 1: return self._sel(motores[0])
-            self.s["estado"] = "guiado_motor"; self.s["opcoes"] = motores[:15]
-            return f"Modelo: {modn}\nQual versão?\n\n" + fmt_lista(motores[:15],"versões")
+            # FIX BUG2: filtra sem nome
+            motores_v = [v for v in motores if _nv(v)] or motores
+            if len(motores_v) == 1: return self._sel(motores_v[0])
+            self.s["estado"] = "guiado_motor"; self.s["opcoes"] = motores_v[:15]
+            return f"Modelo: {modn}\nQual versão?\n\n" + fmt_lista(motores_v[:15],"versões")
 
         if estado == "guiado_motor":
             return self._sel(item)
@@ -421,9 +553,11 @@ class Agente:
                             self.s["peca"] = arts[0]; self.s["estado"] = "detalhe"
                             return fmt_detalhe(arts[0])
                         self.s["estado"] = "lista"; self.s["opcoes"] = arts[:10]
-                        return f"Veículo: {vn} | {cn}\n\n" + fmt_lista(arts[:10],"peças")
+                        label = vn or f"ID {vid}"
+                        return f"Veículo: {label} | {cn}\n\n" + fmt_lista(arts[:10],"peças")
         self.s["estado"] = "guiado_categoria"; self.s["opcoes"] = cats[:20]
-        return f"Veículo: {vn}\n\n" + fmt_lista(cats[:20],"categorias")
+        label = vn or f"Veículo ID {vid}"
+        return f"Veículo: {label}\n\n" + fmt_lista(cats[:20],"categorias")
 
     # ── Pós-detalhe ───────────────────────────────────────────
     def _compat(self):
@@ -436,7 +570,7 @@ class Agente:
         txt = f"Veículos compatíveis com {ref}:\n\n"
         for i, v in enumerate(veics[:15], 1):
             n = _nv(v); ini, fim = _anos(v)
-            txt += f"  {i}. {n}"
+            txt += f"  {i}. {n or '(sem descrição)'}"
             if ini: txt += f" ({ini}" + (f"–{fim}" if fim else "") + ")"
             txt += "\n"
         txt += "\n\n1 → compatíveis  2 → similares  3 → nova busca"
@@ -491,7 +625,8 @@ class Agente:
             "  Texto livre:\n"
             "    fiat palio 2006 embreagem\n"
             "    renault kwid amortecedor\n"
-            "    hyundai hb20 filtro oleo\n\n"
+            "    hyundai hb20 filtro oleo\n"
+            "    motor palio  (só o modelo também funciona)\n\n"
             "  Por código/OEM:\n"
             "    7700115294\n"
             "    oem 0242236561\n\n"
@@ -508,7 +643,7 @@ def main():
     if not RAPIDAPI_KEY:
         print("❌ RAPIDAPI_KEY não encontrada no .env"); sys.exit(1)
     print("=" * 60)
-    print("🧠 AGENTE DE PEÇAS OEM  –  Auto Parts Catalog API")
+    print("🧠 AGENTE DE PEÇAS OEM v2  –  Auto Parts Catalog API")
     print("=" * 60)
     _carregar()
     print("=" * 60)
