@@ -155,7 +155,50 @@ def calculate_score(termo: str, descricao: str, motor: str = None) -> float:
 
     return score
 
+def calculate_final_score(
+    busca,
+    descricao,
+    veiculo="",
+    oem="",
+    fabricante="",
+    motor=None
+):
 
+    texto = f"""
+    {descricao}
+    {veiculo}
+    {oem}
+    {fabricante}
+    """
+
+    base_score = calculate_score(
+        busca,
+        texto,
+        motor
+    )
+
+    busca_n = normalize_text(busca)
+
+    oem_n = normalize_text(oem)
+
+    # OEM exata
+    if busca_n == oem_n:
+
+        base_score += 300
+
+    # OEM parcial
+    elif busca_n in oem_n:
+
+        base_score += 150
+
+    # Fabricante presente
+    if fabricante:
+
+        if fabricante.lower() in texto.lower():
+
+            base_score += 50
+
+    return base_score
 # =========================================================
 # Busca fitment
 # =========================================================
@@ -196,43 +239,74 @@ def search_vehicle_fitment(modelo: str, ano=None) -> list:
 # Produtos por veículo
 # =========================================================
 
-def search_products_by_vehicle(fitments: list, termo: str, motor: str = None) -> list:
+def search_products_by_vehicle(
+    fitments: list,
+    termo: str,
+    motor: str = None
+) -> list:
+
     if not fitments or not termo:
         return []
 
     conn = get_connection()
-    sku_list = list({str(f.get("sku") or f.get("SKU","")) for f in fitments})
-    sku_list = [s for s in sku_list if s]
+
+    sku_list = list({
+        str(f.get("sku") or "")
+        for f in fitments
+        if f.get("sku")
+    })
 
     if not sku_list:
+
         conn.close()
+
         return []
 
     placeholders = ",".join("?" * len(sku_list))
+
     rows = conn.execute(
-        f"SELECT * FROM products WHERE sku_autoflex IN ({placeholders})",
+        f"""
+        SELECT *
+        FROM products
+        WHERE sku_autoflex IN ({placeholders})
+        """,
         sku_list
     ).fetchall()
+
     conn.close()
 
-    if not rows:
-        return []
-
     ranked = []
+
     for row in rows:
-        r    = dict(row)
-        desc = r.get("descricao","")
-        r["_score"] = calculate_score(termo, desc, motor)
+
+        r = dict(row)
+
+        r["_score"] = calculate_final_score(
+            busca=termo,
+            descricao=r.get("descricao", ""),
+            veiculo=r.get("veiculo", ""),
+            oem=r.get("codigo_oem", ""),
+            fabricante=r.get("montadora", ""),
+            motor=motor
+        )
+
         ranked.append(r)
 
-    ranked.sort(key=lambda x: x["_score"], reverse=True)
+    ranked.sort(
+        key=lambda x: x["_score"],
+        reverse=True
+    )
 
     print("\n=== TOP RESULTADOS ===")
+
     for r in ranked[:5]:
-        print(f"  {r['_score']:>6.1f} → {r.get('descricao')}")
+
+        print(
+            f"  {r['_score']:>6.1f} "
+            f"→ {r.get('descricao')}"
+        )
 
     return ranked[:10]
-
 
 # =========================================================
 # Busca direta na tabela oem_parts (sem fitment)
